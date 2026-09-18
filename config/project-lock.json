@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "target": {
+    "board": "Orange Pi 4 LTS",
+    "soc": "RK3399",
+    "host_architecture": "aarch64",
+    "player_architecture": "arm32-soft-float",
+    "controller": "Pioneer DDJ-400",
+    "display": "HDMI 1920x1080",
+    "audio": "DDJ-400 4ch 44100Hz S16_LE"
+  },
+  "firmware": {
+    "model": "XDJ-RX3",
+    "version": "1.20",
+    "stock_player_md5_legacy": "4f2efcfc0c9e3f539289f863acfddcc6",
+    "stock_player_sha256": null,
+    "sha256_status": "awaiting-local-verification"
+  },
+  "upstreams": {
+    "rbtv": "4ce92254df52c8a3a5ac62801555503be68e9782",
+    "PrimeBox": "256a7298c0f3e3d465c897596a8a87aebae4982b",
+    "RX3-Orange-PI-4-LTS_reference_only": "f211c3e49913f2a828e535fda15b5189db07e92a"
+  },
+  "patch_policy": {
+    "validate_full_sha256_before_patch": true,
+    "validate_original_bytes_at_every_site": true,
+    "preserve_original_executable": true,
+    "apply_getPcController_guard": true,
+    "apply_getTotalLength_workaround": false,
+    "allow_cross_version_offsets": false
+  }
+}
