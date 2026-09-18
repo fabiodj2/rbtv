@@ -16,7 +16,6 @@ proven on the **Denon DJ Prime GO**, which is the *same SoC family*.
 | Repo | Target | What we take from it |
 |---|---|---|
 | [PrimeBox](https://github.com/erhan-/PrimeBox) | Denon Prime GO (RK3288) | the **working** `rbp` port: soft-float chroot, DirectFB build, shims, launcher |
-| `rb2go` | POCO X3 (postmarketOS, aarch64) | postmarketOS-side tooling, window/input/usb emulation docs |
 
 The Chromebit is closer to the **Prime GO** (same SoC, hard-float kernel, no
 Wayland requirement) than to the POCO X3.
