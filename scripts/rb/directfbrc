@@ -1,0 +1,25 @@
+# Chromebit DirectFB configuration (chroot).
+#
+# The logical layer must match fbshim16's 1280x800@16 RGB565 view; the rebuilt
+# fbdev driver scales/converts it into the real 1920x1080 RGB32 HDMI fb.
+# Do NOT set pixelformat=rgb32 here (see rb2go docs/07).
+system=fbdev
+fbdev=/dev/fb0
+mode=1280x800
+depth=16
+module-dir=/usr/lib/directfb-1.4-6
+
+# Headless chroot: never touch a virtual terminal.
+#
+# DirectFB 1.4.16's systems/fbdev/vt.c:vt_set_fb() declares `struct stat sbf`
+# and calls fstat(). The stack was built with modern Ubuntu cross headers but
+# links the RX3's glibc 2.13, whose struct stat ABI is smaller/different, so
+# fstat() writes past `sbf`, smashing the stack canary -> SIGABRT (frame:
+# __stack_chk_fail <- vt_set_fb <- dfb_vt_initialize <- system_initialize).
+#
+# system_initialize() only runs that code when dfb_config->vt is true, so
+# disable it. Prime GO never hit this because its chroot had no usable
+# /dev/tty0; the Chromebit does.
+no-vt
+no-vt-switch
+no-vt-switching

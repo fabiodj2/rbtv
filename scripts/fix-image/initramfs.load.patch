@@ -1,0 +1,11 @@
+--- a/initramfs.load
++++ b/initramfs.load
+@@ -16,3 +16,8 @@
+ rockchipdrm
+ sbs-battery
+ videobuf2-dma-sg
++
++usb-storage
++uas
++hid-generic
++evdev

@@ -1,0 +1,18 @@
+[Unit]
+# Starts the rekordbox player (rbp) plus the USB-stick hotplug watcher.
+# Run by systemd on every boot so the Chromebit comes up as a player without
+# anyone logging in.  On-demand: `systemctl restart rb.service` = full restart.
+Description=Rekordbox player (XDJ-RX3 rbp) + USB library hotplug watcher
+Documentation=https://github.com/example/rbtv docs/01-postmarketos-image.md docs/11-usb.md
+After=multi-user.target
+Wants=ddj400-bridge.service rbkeyd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh /home/user/start-rb.sh
+ExecStop=/bin/sh -c 'pkill -f "[r]bp -a"; pkill -f "[e]db_streamd"'
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

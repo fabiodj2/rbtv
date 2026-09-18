@@ -1,0 +1,21 @@
+--- a/init
++++ b/init
+@@ -48,8 +48,18 @@
+ # We need mdev to find the boot partition
+ setup_mdev
+ 
++# Make sure every boot message is visible on the console, even the ones
++# that are normally below the configured loglevel.
++dmesg -n 8 2>/dev/null || true
++echo "8 4 1 7" > /proc/sys/kernel/printk 2>/dev/null || true
++
+ load_modules /lib/modules/initramfs.load
+ 
++# Load USB storage/input modules right away so that USB sticks and
++# keyboards work. Devices plugged in later are handled by
++# usb_hotplug_rescan() while we wait for the partitions.
++load_usb_modules
++
+ setup_usb_network
+ start_unudhcpd
+ 

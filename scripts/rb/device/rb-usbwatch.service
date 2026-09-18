@@ -1,0 +1,16 @@
+[Unit]
+Description=rekordbox USB stick watcher (mount + DeviceSQL import) for rbp
+Documentation=https://github.com/example/rbtv docs/11-usb.md
+After=local-fs.target
+Before=rb.service
+
+[Service]
+Type=forking
+PIDFile=/tmp/usbwatch.pid
+ExecStart=/bin/sh /home/user/usb-watch.sh start
+ExecStop=/bin/sh /home/user/usb-watch.sh stop
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

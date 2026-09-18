@@ -1,0 +1,16 @@
+[Unit]
+Description=Physical keyboard -> XDJ-RX3 rekordbox engine (rbp) control
+Documentation=https://github.com/example/rbtv docs/13-keyboard.md
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rbkeyd -v
+Restart=always
+RestartSec=3
+Nice=-5
+StandardOutput=append:/tmp/rbkeyd.log
+StandardError=append:/tmp/rbkeyd.log
+
+[Install]
+WantedBy=multi-user.target

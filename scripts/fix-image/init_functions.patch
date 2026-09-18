@@ -1,0 +1,205 @@
+--- a/init_functions.sh
++++ b/init_functions.sh
+@@ -316,6 +316,71 @@
+ 	modprobe -a $modules
+ }
+ 
++# Load the modules needed for USB mass storage and USB input devices.
++# This is intentionally safe to call over and over again so that devices
++# which are plugged in *after* boot (hubs, keyboards, USB sticks) get
++# picked up. See usb_hotplug_rescan() below.
++load_usb_modules() {
++	modprobe usb-storage 2>/dev/null || true
++	modprobe uas 2>/dev/null || true
++	modprobe hid-generic 2>/dev/null || true
++	modprobe usbhid 2>/dev/null || true
++	modprobe evdev 2>/dev/null || true
++
++	# Ask every SCSI host to rescan its buses. This catches USB disks
++	# that were attached while usb-storage was being loaded.
++	for host in /sys/class/scsi_host/host*; do
++		[ -e "$host/scan" ] && echo "- - -" > "$host/scan" 2>/dev/null || true
++	done
++}
++
++# Full hot-plug rescan: load modules, rescan SCSI, and let mdev create
++# device nodes for anything that has appeared since the last scan.
++usb_hotplug_rescan() {
++	load_usb_modules
++	mdev -s 2>/dev/null || true
++}
++
++# Software "unplug/replug": toggle the kernel USB port `disable` attribute,
++# which makes the hub drop and re-enumerate whatever is attached. This
++# recovers devices whose first enumeration times out
++# ("device descriptor read/64, error -110") without physically replugging.
++usb_port_reset() {
++	local p
++	local ports=""
++
++	for p in /sys/bus/usb/devices/*/*:*/*-port*/disable; do
++		[ -e "$p" ] || continue
++		ports="$ports $p"
++	done
++	[ -z "$ports" ] && return 0
++
++	echo "$LOG_PREFIX Resetting USB port(s) to re-enumerate:$ports"
++	for p in $ports; do echo 1 > "$p" 2>/dev/null || true; done
++	sleep 2
++	for p in $ports; do echo 0 > "$p" 2>/dev/null || true; done
++	sleep 2
++	usb_hotplug_rescan
++}
++
++# Last resort: rebind the dwc2 host controller, resetting the whole USB bus.
++usb_controller_reset() {
++	local drv="/sys/bus/platform/drivers/dwc2"
++	local d name
++	[ -d "$drv" ] || return 0
++
++	for d in "$drv"/*; do
++		[ -L "$d" ] || continue
++		name="${d##*/}"
++		echo "$LOG_PREFIX Rebinding USB controller $name"
++		echo "$name" > "$drv/unbind" 2>/dev/null || continue
++		sleep 1
++		echo "$name" > "$drv/bind" 2>/dev/null || true
++	done
++	sleep 3
++	usb_hotplug_rescan
++}
++
+ setup_mdev() {
+ 	# Start mdev daemon
+ 	mdev -d
+@@ -546,6 +611,7 @@
+ 	local partition=""
+ 	local status=""
+ 	local type=""
++	local fsck_wait
+ 
+ 	partition="$1"
+ 	type="$(get_partition_type "$partition")"
+@@ -586,9 +652,18 @@
+ 
+ 	if [ "$status" = "fail" ]; then
+ 		splash_set_warning "Filesystem needs manual repair (fsck) ($partition)\nhttps://postmarketos.org/troubleshooting\n\nBoot anyways by pressing Volume-Up or Left-Shift..."
+-		while ! iskey KEY_LEFTSHIFT KEY_VOLUMEUP ; do
+-			:
++		echo "$LOG_PREFIX WARNING: fsck reported problems on $partition"
++		# Automatically continue after a short delay, so no keyboard is
++		# required. Pressing Left-Shift/Volume-Up still skips the wait.
++		fsck_wait=10
++		while [ "$fsck_wait" -gt 0 ]; do
++			if iskey KEY_LEFTSHIFT KEY_VOLUMEUP; then
++				break
++			fi
++			sleep 1
++			fsck_wait=$((fsck_wait - 1))
+ 		done
++		echo "$LOG_PREFIX Continuing boot anyway."
+ 	fi
+ 
+ 	splash_set_message "Loading"
+@@ -665,18 +740,64 @@
+ 		return
+ 	fi
+ 
++	echo "$LOG_PREFIX Waiting for $description partition (hot-plug friendly, retrying forever)..."
+ 	splash_set_message "Waiting for $description partition"
+-	for _ in $(seq 1 30); do
++
++	# Load USB storage/input modules up-front so USB media and keyboards
++	# that are already plugged in get detected.
++	usb_hotplug_rescan
++
++	local waited=0
++	local timeout="${PMOS_WAIT_TIMEOUT:-0}"
++	local announced=0
++
++	# Never give up: a device may be plugged in later. Keep loading
++	# modules and rescanning so hot-plugging actually works. If
++	# PMOS_WAIT_TIMEOUT is set (seconds) we only print an extra error
++	# banner after that long - we still keep retrying.
++	while true; do
+ 		sleep 1
++		waited=$((waited + 1))
++		load_usb_modules
+ 		$findfunc partition
+ 		if [ -n "$partition" ]; then
++			echo "$LOG_PREFIX Found $description partition: $partition"
+ 			return
+ 		fi
++
++		# Every 5 seconds do a full rescan and print diagnostics so
++		# the reason for a failure is visible on the console.
++		if [ "$((waited % 5))" -eq 0 ]; then
++			usb_hotplug_rescan
++			echo "$LOG_PREFIX Still waiting for $description partition (${waited}s)..."
++			echo "$LOG_PREFIX --- blkid ---"
++			blkid 2>/dev/null
++			echo "$LOG_PREFIX --- /proc/partitions ---"
++			cat /proc/partitions
++			echo "$LOG_PREFIX --- usb devices ---"
++			ls /sys/bus/usb/devices 2>/dev/null
++		fi
++
++		# Escalating USB recovery: the kernel's own enumeration retry
++		# usually succeeds within ~20s. If we are still stuck after
++		# that, do a software replug of the USB ports, and as a last
++		# resort rebind the dwc2 controller - no physical replug needed.
++		case "$waited" in
++			15) usb_port_reset ;;
++			30) usb_controller_reset ;;
++		esac
++		if [ "$waited" -gt 30 ] && [ "$((waited % 30))" -eq 0 ]; then
++			usb_port_reset
++		fi
++
++		if [ "$timeout" -gt 0 ] && [ "$waited" -ge "$timeout" ] && [ "$announced" -eq 0 ]; then
++			announced=1
++			echo "$LOG_PREFIX ERROR: $description partition not found after ${timeout}s - continuing to retry."
++			splash_set_message "Waiting for $description partition (still trying)"
++		fi
++
+ 		check_keys ""
+ 	done
+-
+-	splash_set_error "$description partition not found!\nhttps://postmarketos.org/troubleshooting"
+-	fail_halt_boot
+ }
+ 
+ wait_boot_partition() {
+@@ -1433,8 +1554,30 @@
+ 
+ fail_halt_boot() {
+ 	beebzzr -b 3 -d 250 &
+-	export_logs
+-	debug_shell
++
++	# No keyboard may be available, so print as much diagnostic info as
++	# possible to the console before doing anything interactive.
++	echo "$LOG_PREFIX FATAL: boot failed, dumping diagnostics"
++	echo "$LOG_PREFIX --- /proc/cmdline ---"
++	cat /proc/cmdline
++	echo "$LOG_PREFIX --- /proc/partitions ---"
++	cat /proc/partitions
++	echo "$LOG_PREFIX --- blkid ---"
++	blkid 2>/dev/null
++	echo "$LOG_PREFIX --- USB devices ---"
++	ls /sys/bus/usb/devices 2>/dev/null
++	echo "$LOG_PREFIX --- last kernel messages ---"
++	dmesg 2>/dev/null | tail -n 50
++
++	# Best-effort log export via USB mass storage (may not be possible).
++	export_logs 2>/dev/null || true
++
++	# Automatically reboot to retry instead of waiting for a keypress.
++	echo "$LOG_PREFIX Rebooting in 30 seconds to retry boot (no keyboard needed)..."
++	sleep 30
++	echo "$LOG_PREFIX Rebooting now."
++	reboot -f
++
+ 	echo "Looping forever"
+ 	while true; do
+ 		sleep 1

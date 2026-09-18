@@ -1,0 +1,9 @@
+timeout 1
+default postmarketOS
+menu title boot prev kernel
+
+label postmarketOS
+	kernel /vmlinuz
+	fdtdir /
+	initrd /initramfs
+	append quiet splash plymouth.ignore-serial-consoles plymouth.prefer-fbcon loglevel=2 pmos_boot_uuid=be0bc07d-8f9e-4de9-8ef2-79cdf3d06252 pmos_root_uuid=9ec6c08d-efcc-4cdf-bed9-53b7761bb6ba pmos_rootfsopts=defaults

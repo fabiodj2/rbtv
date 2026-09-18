@@ -1,0 +1,16 @@
+[Unit]
+Description=Pioneer DDJ-400 -> XDJ-RX3 rekordbox engine (rbp) MIDI bridge
+Documentation=https://github.com/example/rbtv docs/12-ddj400.md
+After=sound.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ddj400-bridge -v
+Restart=always
+RestartSec=2
+Nice=-5
+StandardOutput=append:/tmp/ddj400.log
+StandardError=append:/tmp/ddj400.log
+
+[Install]
+WantedBy=multi-user.target

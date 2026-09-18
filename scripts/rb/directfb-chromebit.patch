@@ -1,0 +1,352 @@
+--- a/systems/fbdev/fbdev.c	2026-09-11 20:29:29.472224817 +0200
++++ b/systems/fbdev/fbdev.c	2026-09-11 20:28:48.118948207 +0200
+@@ -159,6 +159,27 @@
+      /* copy the whole logical buffer to scratch first (safe in-place) */
+      memcpy( scratch, src, (size_t)sh * spitch );
+ 
++     if (src_bpp == 2 && deg == 0 && sw > 0 && sh > 0 && fw > 0 && fh > 0) {
++          /* Chromebit HDMI: scale the logical RGB565 frame to fill the whole
++           * physical RGB32 fb (nearest neighbour, 16.16 fixed point).
++           * 1280x800 -> 1920x1080 covers every destination pixel, so stale
++           * content (and the letterbox area) is cleared each frame. */
++          unsigned int xstep = (unsigned int)(((unsigned long)sw << 16) / fw);
++          unsigned int ystep = (unsigned int)(((unsigned long)sh << 16) / fh);
++
++          for (y = 0; y < (unsigned)fh; y++) {
++               const unsigned short *srow = (const unsigned short *)
++                    (scratch + (size_t)((y * ystep) >> 16) * spitch);
++               unsigned int *drow = (unsigned int *)(dst + (size_t)y * fpitch);
++               unsigned int xf = 0;
++               for (x = 0; x < (unsigned)fw; x++) {
++                    drow[x] = rgb565_to_rgb32( srow[xf >> 16] );
++                    xf += xstep;
++               }
++          }
++          return;
++     }
++
+      if (src_bpp == 2) {
+           /* RGB16 source -> RGB32 fb: convert while rotating */
+           for (y = 0; y < (unsigned)sh; y++) {
+@@ -275,6 +296,14 @@
+                                         DFBSurfaceFlipFlags         flags,
+                                         CoreSurfaceBufferLock      *lock );
+ 
++static DFBResult primaryUpdateRegion  ( CoreLayer                  *layer,
++                                        void                       *driver_data,
++                                        void                       *layer_data,
++                                        void                       *region_data,
++                                        CoreSurface                *surface,
++                                        const DFBRegion            *update,
++                                        CoreSurfaceBufferLock      *lock );
++
+ 
+ static DisplayLayerFuncs primaryLayerFuncs = {
+      .LayerDataSize      = primaryLayerDataSize,
+@@ -288,6 +317,7 @@
+      .SetRegion          = primarySetRegion,
+      .RemoveRegion       = primaryRemoveRegion,
+      .FlipRegion         = primaryFlipRegion,
++     .UpdateRegion       = primaryUpdateRegion,
+ };
+ 
+ /******************************************************************************/
+@@ -410,7 +440,10 @@
+      }
+ 
+      /* should be closed automatically in children upon exec(...) */
+-     if (fcntl( dfb_fbdev->fd, F_SETFD, FD_CLOEXEC ) < 0)
++     /* chromebit: use the raw syscall - glibc 2.28+ versions fcntl(), but the
++      * RX3 chroot ships glibc 2.13 (only fcntl@GLIBC_2.4).  A versioned
++      * GLIBC_2.28 reference makes dlopen() of this module fail. */
++     if (syscall( SYS_fcntl64, dfb_fbdev->fd, F_SETFD, FD_CLOEXEC ) < 0)
+      {
+           D_PERROR( "Fusion/Init: Setting FD_CLOEXEC flag failed!\n" );
+           goto error;
+@@ -565,7 +598,6 @@
+ 
+      dfb_fbdev->core   = core;
+      dfb_fbdev->shared = shared;
+-     { FILE*f=fopen("/tmp/dfbdig.log","a"); if(f){fprintf(f,"system_initialize called\n"); fclose(f);} }
+ 
+      page_size = direct_pagesize();
+ 
+@@ -620,7 +652,6 @@
+                     "Could not disable console acceleration!\n" );
+           goto error;
+      }
+-     { FILE*f=fopen("/tmp/dfbdig.log","a"); if(f){fprintf(f,"PROBE: fb opened, accel-disable PUT ok, fix.smem_len=%u yv=%u bpp=%u\n", shared->fix.smem_len, shared->current_var.yres_virtual, shared->current_var.bits_per_pixel); fclose(f);} }
+ 
+      dfb_fbdev_var_to_mode( &shared->current_var,
+                             &shared->current_mode );
+@@ -630,18 +661,25 @@
+       * The actual geometry comes from the layer region config at flip time,
+       * here we only remember the physical fb geometry. */
+      shared->rot_deg    = 0;
++     shared->rot_enable = 0;
+      shared->rot_scratch = NULL;
+      shared->rot_surface = NULL;
+      shared->rot_surface_size = 0;
+      {
+           const char *rot = getenv( "DFB_ROTATE" );
+-          if (rot && rot[0] && strcmp( rot, "off" ) != 0) {
+-               if (!strcmp( rot, "left" ))
+-                    shared->rot_deg = 90;
+-               else if (!strcmp( rot, "right" ))
+-                    shared->rot_deg = 270;
+-               else
+-                    shared->rot_deg = atoi( rot );
++          /* chromebit: the logical layer is RGB565 (via the fb shim) while
++           * the real HDMI fb is RGB32, so always use the software
++           * scale+convert path. Rotation stays optional. */
++          if (1) {
++               if (rot && rot[0] && strcmp( rot, "off" ) != 0) {
++                    if (!strcmp( rot, "left" ))
++                         shared->rot_deg = 90;
++                    else if (!strcmp( rot, "right" ))
++                         shared->rot_deg = 270;
++                    else
++                         shared->rot_deg = atoi( rot );
++               }
++               shared->rot_enable = 1;
+ 
+                /* read the REAL fb geometry via raw syscall (bypasses the
+                 * LD_PRELOAD shim that lies to rbp about the logical size) */
+@@ -668,7 +706,6 @@
+                     else
+                          shared->rot_fpitch = shared->fix.line_length;
+                }
+-               { FILE*f=fopen("/tmp/dfbdig9.log","a"); if(f){fprintf(f,"ROTINIT: real_fb=%dx%d pitch=%d (orig_var=%dx%d)\n",shared->rot_fw,shared->rot_fh,shared->rot_fpitch,shared->orig_var.xres,shared->orig_var.yres); fclose(f);} }
+ 
+                /* logical layer geometry (shimmed): orig_var carries the
+                 * logical xres/yres/bpp that rbp believes in. */
+@@ -689,7 +726,7 @@
+                     D_INFO( "FBDev/Rotate: rotation %d enabled (fb %dx%d)\n",
+                             shared->rot_deg, shared->rot_fw, shared->rot_fh );
+                else {
+-                    shared->rot_deg = 0;
++                    shared->rot_enable = 0;
+                     if (shared->rot_scratch) { free(shared->rot_scratch); shared->rot_scratch = NULL; }
+                     if (shared->rot_surface) { free(shared->rot_surface); shared->rot_surface = NULL; }
+                }
+@@ -1624,19 +1661,18 @@
+                }
+ 
+                ret = dfb_fbdev_set_mode( mode, surface, config->source.x,
+-                                         lock->offset / lock->pitch + config->source.y );
++                                         dfb_fbdev->shared->rot_enable
++                                         ? config->source.y
++                                         : lock->offset / lock->pitch + config->source.y );
+                if (ret)
+                     return ret;
+           }
+           else {
+                int yofs;
+-               if (dfb_fbdev->shared->rot_deg) {
+-                    /* ROTATION: convert the logical buffer offset to a
+-                     * physical fb row offset (fh rows per buffer). */
+-                    int sw  = config->source.w;
+-                    int sh  = config->source.h;
+-                    int idx = lock->offset / (sw * 4 * sh);
+-                    yofs = idx * dfb_fbdev->shared->orig_var.yres + config->source.y;
++               if (dfb_fbdev->shared->rot_enable) {
++                    /* Chromebit/RK3288: the VOP does not present a panned
++                     * buffer, so never pan away from physical buffer 0. */
++                    yofs = config->source.y;
+                }
+                else
+                     yofs = lock->offset / lock->pitch + config->source.y;
+@@ -1667,6 +1703,74 @@
+      return DFB_OK;
+ }
+ 
++/* Publish the converted/scaled frame into the physical fb (or the shared
++ * shm file in window mode).  Shared by the flip path (full-surface swap)
++ * and the update path (partial/BLIT updates, which is what rbp actually
++ * uses for most redraws) so the frame is always presented regardless of
++ * which path DirectFB's core takes.  Chromebit: rotation is 0, but the
++ * RGB565->RGB32 scale/convert is still required, so gate on rot_enable. */
++static DFBResult
++publish_rotated_frame( CoreSurfaceBufferLock *lock )
++{
++     FBDevShared *shared = dfb_fbdev->shared;
++     CoreLayerRegionConfig *config = &shared->config;
++     int sw  = config->width  ? config->width  : 1280;
++     int sh  = config->height ? config->height : 800;
++     int spitch = lock->pitch ? lock->pitch : shared->fix.line_length;
++     int fw  = shared->rot_fw;
++     int fh  = shared->rot_fh;
++     int fpitch = shared->rot_fpitch;
++     int idx = 0;
++
++     if (!shared->rot_enable || !shared->rot_surface)
++          return DFB_OK;
++
++     /* Chromebit/RK3288: the VOP does not present the panned buffer (the
++      * fb yoffset / plane src_y is ignored by the hardware here), so always
++      * render into physical buffer 0 and keep the pan at 0.  The frame is
++      * still read from rot_surface + lock->offset (DirectFB cycles its own
++      * buffers); only the destination is pinned. */
++     idx = 0;
++
++     fbdev_rotate_primary( (unsigned char*)shared->rot_surface + lock->offset,
++                           sw, sh, spitch,
++                           dfb_fbdev->framebuffer_base + idx * fh * fpitch,
++                           fw, fh, fpitch,
++                           shared->rot_deg );
++
++     /* the pixels are already in the fb; panning just selects the buffer.
++      * Don't propagate a pan error - the frame is written either way. */
++     dfb_fbdev_pan( config->source.x, config->source.y, false );
++
++     return DFB_OK;
++}
++
++static DFBResult
++primaryUpdateRegion( CoreLayer             *layer,
++                     void                  *driver_data,
++                     void                  *layer_data,
++                     void                  *region_data,
++                     CoreSurface           *surface,
++                     const DFBRegion       *update,
++                     CoreSurfaceBufferLock *lock )
++{
++     D_DEBUG_AT( FBDev_Primary, "%s()\n", __FUNCTION__ );
++
++     if (dfb_fbdev->shared->rot_enable) {
++          static int _updn = 0;
++          if (_updn < 8) {
++               FILE*f=fopen("/tmp/flipdbg.log","a");
++               if(f){ fprintf(f,"UPDATE %d cfg=%dx%d spitch=%d off=%d\n",
++                              _updn, dfb_fbdev->shared->config.width,
++                              dfb_fbdev->shared->config.height, lock->pitch,
++                              (int)lock->offset); fclose(f); }
++          }
++          _updn++;
++          return publish_rotated_frame( lock );
++     }
++     return DFB_OK;
++}
++
+ static DFBResult
+ primaryFlipRegion( CoreLayer             *layer,
+                    void                  *driver_data,
+@@ -1685,34 +1789,18 @@
+          !dfb_config->pollvsync_after)
+           dfb_screen_wait_vsync( dfb_screens_at(DSCID_PRIMARY) );
+ 
+-     if (dfb_fbdev->shared->rot_deg) {
+-          /* ROTATION (Prime GO): the layer surface is a logical (swapped)
+-           * buffer (e.g. 1280x800, pitch 5120) inside the fb memory.
+-           * Rotate it in place into the physical fb layout (800x1280,
+-           * pitch 3200) and pan to the fb buffer it lives in. */
+-          FBDevShared *shared = dfb_fbdev->shared;
+-          int sw  = config->width;
+-          int sh  = config->height;
+-          int spitch = lock->pitch ? lock->pitch : shared->fix.line_length;
+-          int fw  = shared->rot_fw;
+-          int fh  = shared->rot_fh;
+-          int fpitch = shared->rot_fpitch;
+-          int idx = 0;
+-          { FILE*f=fopen("/tmp/dfbdig9.log","a"); if(f){fprintf(f,"flip: rot_deg=%d cfg=%dx%d lock.pitch=%d off=%d\n",shared->rot_deg,sw,sh,lock->pitch,(int)lock->offset); fclose(f);} }
+-          { FILE*f=fopen("/tmp/rot_surface.dump","wb"); if(f){ fwrite(shared->rot_surface,1,(size_t)shared->rot_surface_size,f); fclose(f);} }
+-
+-          if (spitch > 0 && sh > 0)
+-               idx = lock->offset / (spitch * sh);
+-
+-          fbdev_rotate_primary( (unsigned char*)shared->rot_surface + lock->offset,
+-                                sw, sh, spitch,
+-                                dfb_fbdev->framebuffer_base + idx * fh * fpitch,
+-                                fw, fh, fpitch,
+-                                shared->rot_deg );
+-
+-          ret = dfb_fbdev_pan( config->source.x,
+-                               idx * fh + config->source.y,
+-                               (flags & DSFLIP_WAITFORSYNC) == DSFLIP_ONSYNC );
++     if (dfb_fbdev->shared->rot_enable) {
++          { static int _flipn = 0;
++            if (_flipn < 8) {
++                 FILE*f=fopen("/tmp/flipdbg.log","a");
++                 if(f){ fprintf(f,"FLIP %d cfg=%dx%d spitch=%d off=%d rot_deg=%d rot_en=%d\n",
++                                _flipn, config->width, config->height, lock->pitch,
++                                (int)lock->offset, dfb_fbdev->shared->rot_deg,
++                                dfb_fbdev->shared->rot_enable); fclose(f); }
++            }
++            _flipn++;
++          }
++          ret = publish_rotated_frame( lock );
+           if (ret)
+                return ret;
+      }
+@@ -1775,7 +1863,7 @@
+ 
+      var = &shared->current_var;
+ 
+-     if (dfb_fbdev->shared->rot_deg && shared->real_var.xres)
++     if (dfb_fbdev->shared->rot_enable && shared->real_var.xres)
+           var = &shared->real_var;   /* PATCH: use the REAL fb geometry (the
+                                         LD_PRELOAD shim may lie to rbp) */
+ 
+@@ -2156,7 +2244,7 @@
+                var.blue           = real.blue;
+                var.transp         = real.transp;
+                var.grayscale      = real.grayscale;
+-               if (dfb_fbdev->shared->rot_deg) {
++               if (dfb_fbdev->shared->rot_enable) {
+                     var.xres          = real.xres;
+                     var.yres          = real.yres;
+                     var.xres_virtual  = real.xres_virtual;
+--- a/systems/fbdev/fbdev.h	2026-09-11 20:29:29.472224817 +0200
++++ b/systems/fbdev/fbdev.h	2026-09-11 14:32:22.602349222 +0200
+@@ -108,6 +108,7 @@
+       *   rot_fpitch= physical fb line_length (e.g. 3200)
+       *   rot_scratch = scratch buffer for the software rotation */
+      int                      rot_deg;
++     int                      rot_enable;   /* chromebit: scale/convert even with deg 0 */
+      int                      rot_sw;
+      int                      rot_sh;
+      int                      rot_spitch;
+--- a/systems/fbdev/fbdev_surface_pool.c	2026-09-11 20:29:29.472224817 +0200
++++ b/systems/fbdev/fbdev_surface_pool.c	2026-09-11 16:07:46.601950386 +0200
+@@ -112,7 +112,7 @@
+      ret_desc->caps              = CSPCAPS_PHYSICAL | CSPCAPS_VIRTUAL;
+      ret_desc->access[CSAID_CPU] = CSAF_READ | CSAF_WRITE | CSAF_SHARED;
+      ret_desc->access[CSAID_GPU] = CSAF_READ | CSAF_WRITE | CSAF_SHARED;
+-     ret_desc->types             = CSTF_LAYER | CSTF_WINDOW | CSTF_CURSOR | CSTF_FONT | CSTF_SHARED | CSTF_EXTERNAL;
++     ret_desc->types             = CSTF_LAYER | CSTF_WINDOW | CSTF_CURSOR | CSTF_FONT | CSTF_SHARED | CSTF_INTERNAL | CSTF_EXTERNAL;
+      ret_desc->priority          = CSPP_DEFAULT;
+ 
+      /* For hardware layers */
+@@ -362,7 +362,10 @@
+ 
+           D_DEBUG_AT( FBDev_Surfaces, "  -> primary layer buffer (index %d)\n", index );
+ 
+-          if (dfb_fbdev->shared->rot_deg) {
++          if (dfb_fbdev->shared->rot_enable) {
++               /* chromebit: scale/convert path active even with rot_deg == 0,
++                * so the primary layer surface must live in SYSTEM memory
++                * (rot_surface) like the rotated Prime GO case. */
+                /* ROTATION (Prime GO): the primary layer surface is the
+                 * swapped/logical geometry.  Pitch depends on the layer
+                 * pixel format (RGB16 => 2 Bpp, RGB32 => 4 Bpp). */
+@@ -388,7 +391,6 @@
+           lock->offset = alloc->chunk->offset;
+ 
+           /* dump first non-primary surface for diagnosis (addr computed: fb mem) */
+-          { static int dumps=0; if (dumps < 1) { void *a = (char*)dfb_fbdev->framebuffer_base + lock->offset; FILE*f=fopen("/tmp/win_surface.dump","wb"); if(f){ fprintf(f,"T=0x%x CFG=%dx%d P=%d\n", allocation->type, allocation->config.size.w, allocation->config.size.h, lock->pitch); fwrite(a,1,4096000,f); fclose(f);} dumps++; } }
+      }
+      { FILE*f=fopen("/tmp/dfbdig9.log","a"); if(f){fprintf(f,"pool: NONPRIMARY cfg=%dx%d pitch=%d off=%d\n",allocation->config.size.w,allocation->config.size.h,lock->pitch,(int)lock->offset); fclose(f);} }
+ 
+@@ -399,11 +401,10 @@
+       * (a clean buffer separate from the fb), so rbp draws there without
+       * clobbering the fb destination we rotate into. */
+      if ((allocation->type & CSTF_LAYER && allocation->resource_id == DLID_PRIMARY) &&
+-         dfb_fbdev->shared->rot_deg && dfb_fbdev->shared->rot_surface)
++         dfb_fbdev->shared->rot_enable && dfb_fbdev->shared->rot_surface)
+           lock->addr = (char*)dfb_fbdev->shared->rot_surface + lock->offset;
+ 
+      /* dump first non-primary surface for diagnosis */
+-     { static int dumps=0; if (!(allocation->type & CSTF_LAYER) && dumps < 1 && lock->addr) { FILE*f=fopen("/tmp/win_surface.dump","wb"); if(f){ fprintf(f,"TYPE=0x%x CFG=%dx%d PITCH=%d\n", allocation->type, allocation->config.size.w, allocation->config.size.h, lock->pitch); fwrite(lock->addr,1,4096000,f); fclose(f);} dumps++; } }
+ 
+ 
+      D_DEBUG_AT( FBDev_SurfLock, "  -> offset %lu, pitch %d, addr %p, phys 0x%08lx\n",

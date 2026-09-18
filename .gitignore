@@ -1,0 +1,35 @@
+# Large build artifacts / flashable images (regenerate or fetch separately)
+images/*.img
+images/*.img.xz
+images/*.img.zst
+images/*.img.gz
+work/
+mnt/
+staging/
+extracted/
+
+# Firmware / keys / proprietary material (must never be committed)
+keys/
+*.key
+*.UPD
+*.upd
+*.iso
+rootfs.cramfs
+export.pdb
+*.pdb
+
+# Credentials / secrets (never commit)
+.env
+.env.*
+*.pem
+id_rsa*
+id_ed25519*
+known_hosts
+
+# Large image checksums
+images/*.sha256
+
+# Build outputs
+*.o
+*.log
+*.tmp
