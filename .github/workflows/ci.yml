@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      # scripts/fix-image/patched/ is a modified postmarketOS initramfs
+      # (third-party, GPL-2.0-or-later, see its own README) — not ours to
+      # restyle, so it is excluded here.
+      - name: Find shell scripts
+        run: |
+          find . -name '*.sh' \
+            -not -path './.git/*' \
+            -not -path './scripts/fix-image/patched/*' \
+            | sort > shlist.txt
+          cat shlist.txt
+      - name: shellcheck (errors)
+        run: xargs -a shlist.txt shellcheck -S error
+      - name: shellcheck (warnings, informational)
+        run: xargs -a shlist.txt shellcheck -S warning
+        continue-on-error: true
+
+  c-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install soft-float ARM cross toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabi
+      # Syntax-only check against the real target toolchain/ABI (armv5t,
+      # soft-float) used by scripts/rb/shims-Makefile. This catches type and
+      # syntax errors but cannot fully build or link: the shims are
+      # LD_PRELOADed into the proprietary XDJ-RX3 rootfs (RX3=... in
+      # build-shims.sh), which is firmware we neither ship nor fetch here
+      # (see NOTICE.md). scripts/rb/probe/dfbtest.c needs DirectFB headers
+      # from that same rootfs and is skipped for the same reason.
+      - name: Syntax-check shim/device C sources (arm-linux-gnueabi, soft-float)
+        run: |
+          set -eu
+          fail=0
+          for f in scripts/rb/*.c scripts/rb/device/*.c; do
+            echo "== $f =="
+            arm-linux-gnueabi-gcc -fsyntax-only -march=armv5t -mfloat-abi=soft \
+              -Wall -Wextra -Wno-unused-parameter -std=gnu99 "$f" || fail=1
+          done
+          exit $fail
+
+  python-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Byte-compile Python sources
+        run: |
+          set -eu
+          find . -name '*.py' -not -path './.git/*' -print0 \
+            | xargs -0 -n1 python3 -m py_compile

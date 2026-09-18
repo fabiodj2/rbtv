@@ -125,6 +125,18 @@ How the HDMI display works (and every bug that had to be fixed):
 [docs/06-rb-build.md](docs/06-rb-build.md). Live checklist:
 [docs/04-roadmap.md](docs/04-roadmap.md).
 
+### 4. Test
+
+Static checks (shellcheck, ARM soft-float syntax check, Python) run in CI on
+every push/PR. After a deploy, verify the device with a single PASS/FAIL
+smoke test:
+
+```sh
+PASS=<password> HOST=root@chromebit.local ./scripts/rb/run-device-tests.sh
+```
+
+Details: [docs/17-testing.md](docs/17-testing.md).
+
 ## Documentation
 
 ```
@@ -145,6 +157,7 @@ docs/13-keyboard.md          physical USB keyboard control (rbkeyd, evdev -> FIF
 docs/14-handover.md          session handover: deployed state, input, playback fix pointer
 docs/15-playback-fix.md      why PLAY did nothing (getTotalLength workaround) + FIFO restart gotcha
 docs/16-handoff.md           latest session handoff: hashes, rebuild/deploy, open pop + crash fixes
+docs/17-testing.md           static checks (CI) + device smoke tests (selftest.sh)
 scripts/fix-image/           the exact image-fix procedure + patches
 scripts/rb/                  DirectFB/rbp build, deploy and on-device diagnostics
 scripts/rb/probe/            DirectFB bring-up probe (dfbtest)
