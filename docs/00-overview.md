@@ -27,12 +27,13 @@ So the Chromebit is a *closer* target to the Prime GO than to the POCO X3:
 | Kernel | aarch64 + AArch32 compat | armv7 hard-float | **armv7 hard-float** | **aarch64 + AArch32 compat (assumed)** |
 | SoC | Snapdragon 732G | **RK3288** | **RK3288** | **RK3399** |
 | Display | phone panel + Wayland | 800×1280 panel, DRM fb | **HDMI, DRM fb** | **HDMI + USB touch, fbdev/DRM TBD** |
-| postmarketOS | yes | no (Engine OS) | **yes** | **TBD — OS installed, not yet surveyed** |
+| OS | postmarketOS | no (Engine OS) | postmarketOS | **Armbian** |
 
 A second target is now in progress: an **Orange Pi 4 LTS (RK3399) with a USB
-touchscreen and a DDJ-400**. Its kernel/SoC profile is closer to rb2go's
-(64-bit + 32-bit compat) than to the Chromebit's, and it's the first target
-with touch — see [18-orangepi4-lts-port-plan](18-orangepi4-lts-port-plan.md).
+touchscreen and a DDJ-400**, running **Armbian** (Debian/Ubuntu-based). Its
+kernel/SoC profile is closer to rb2go's (64-bit + 32-bit compat) than to the
+Chromebit's, and it's the first target with touch — see
+[18-orangepi4-lts-port-plan](18-orangepi4-lts-port-plan.md).
 
 The main work is therefore **reusing PrimeBox** (chroot + shims) and swapping
 the device-specific layers:

@@ -28,7 +28,7 @@ aarch64 + AArch32 compat), per the comparison table in
 | SoC | Snapdragon 732G | RK3288 | RK3288 | **RK3399** |
 | Display | phone panel + Wayland | 800×1280 panel, DRM fb | HDMI, DRM fb | **HDMI + touch panel?, DRM (KMS or fbdev?)** |
 | Touch | capacitive (phone) | ILI2117 capacitive | — | **USB HID touchscreen** |
-| postmarketOS | yes | no (Engine OS) | yes | **unknown — you said an OS is already installed** |
+| OS | postmarketOS | no (Engine OS) | postmarketOS | **Armbian (Debian/Ubuntu-based)** |
 
 So for the **kernel/chroot/shim-build side, rb2go is the template**, not
 PrimeBox — this repo already carries rb2go-derived code
@@ -170,14 +170,19 @@ for that rather than expecting it to work first try.
 
 ## 3. What we still don't know (please check and report back)
 
+OS confirmed: **Armbian**. Everything else in this section is still open.
 This session has no network path to your LAN, so it can only work from
 docs and what you paste back — same "survey first" approach as
 [docs/05-chromebit-survey.md](05-chromebit-survey.md) used for the Chromebit.
 Please run and paste back:
 
 ```sh
-uname -a
-cat /etc/os-release
+uname -a                                    # kernel version + confirm aarch64
+cat /etc/armbian-release 2>/dev/null        # BOARD=, BRANCH= (legacy/current/edge), VERSION=
+dpkg --print-architecture; dpkg --print-foreign-architectures 2>/dev/null
+zcat /proc/config.gz 2>/dev/null | grep -E '^CONFIG_(COMPAT|ARM64_COMPAT)=' \
+  || grep -E '^CONFIG_(COMPAT|ARM64_COMPAT)=' /boot/config-$(uname -r) 2>/dev/null
+
 cat /proc/asound/cards; aplay -l
 ls /dev/fb0 2>/dev/null; cat /sys/class/graphics/fb0/virtual_size 2>/dev/null
 ls /sys/class/drm/; for c in /sys/class/drm/card*-*; do echo "$c: $(cat $c/status 2>/dev/null)"; done
@@ -187,15 +192,19 @@ lsusb
 df -h /
 ```
 
-Plus: which OS is actually installed (postmarketOS / Armbian / Debian /
-something else) and its kernel version — that decides whether Phase 2 below
-starts from an existing 32-bit-compat-ready image or needs a kernel
-config change first.
+`BRANCH=` in `/etc/armbian-release` matters: Armbian's **legacy** kernels for
+RK3399 boards are Rockchip's older downstream 4.4 tree (BSP-style, closer to
+what a lot of RK3399 vendor images use — usually has `CONFIG_COMPAT=y` and
+`/dev/fb0` out of the box since it predates the DRM-only push), while
+**current**/**edge** are recent mainline (better DRM/KMS, but fbdev emulation
+may be off by default — see §2b). Whichever it is changes which fork of
+Phase 2 (§2b below) applies, so this is the single most useful thing to paste
+back first.
 
 ## 4. Phased roadmap (mirrors docs/04's structure)
 
 ### Phase 0 — Confirm the target environment ⏳ (blocks everything)
-- [ ] OS + kernel identified, aarch64 confirmed
+- [x] OS identified: Armbian — [ ] kernel version + `BRANCH=` + aarch64 confirmed
 - [ ] 32-bit compat confirmed (or a plan to enable it)
 - [ ] Display: `/dev/fb0` present? DRM connector(s) and status
 - [ ] Audio: `aplay -l` output
