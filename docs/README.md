@@ -21,6 +21,8 @@ Start here:
 | [14-handover](14-handover.md) | Session handover: deployed artefacts/hashes, restore commands, input, playback fix |
 | [15-playback-fix](15-playback-fix.md) | Why PLAY did nothing: the rb2go `getTotalLength` workaround, and the FIFO/daemon restart gotcha |
 | [16-handoff](16-handoff.md) | **Session handoff**: deployed hashes, rebuild/deploy, open audio-pop fix, latent `keyshim`/`UiMain` crash |
+| [17-testing](17-testing.md) | Static checks (CI) + device smoke tests (`selftest.sh`) |
+| [18-orangepi4-lts-port-plan](18-orangepi4-lts-port-plan.md) | **Second target**: Orange Pi 4 LTS (RK3399) + USB touchscreen + DDJ-400 — plan, what carries over, what's new, survey checklist |
 
 Related, external to this folder:
 

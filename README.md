@@ -15,10 +15,19 @@ proven on the **Denon DJ Prime GO**, which is the *same SoC family*.
 
 | Repo | Target | What we take from it |
 |---|---|---|
-| [PrimeBox](https://github.com/erhan-/PrimeBox) | Denon Prime GO (RK3288) | the **working** `rbp` port: soft-float chroot, DirectFB build, shims, launcher |
+| [PrimeBox](https://github.com/erhan-/PrimeBox) | Denon Prime GO (RK3288) | the **working** `rbp` port: soft-float chroot, DirectFB build, shims, launcher, and (for the Orange Pi target below) the touchscreen shim |
+| `rb2go` | Xiaomi POCO X3 (Snapdragon 732G) | postmarketOS glue for an **aarch64 + AArch32-compat** target — the template for the Orange Pi 4 LTS below, not the Chromebit |
 
 The Chromebit is closer to the **Prime GO** (same SoC, hard-float kernel, no
 Wayland requirement) than to the POCO X3.
+
+## Second target: Orange Pi 4 LTS (RK3399) + touch + DDJ-400
+
+Planning stage — see [docs/18-orangepi4-lts-port-plan](docs/18-orangepi4-lts-port-plan.md)
+for the architecture comparison, what carries over from the Chromebit port
+unchanged (chroot/shim build, `rbp`'s internal addresses, the DDJ-400 bridge),
+what's new (a 64-bit kernel needs 32-bit compat, and this is the first target
+with a touchscreen), and the survey checklist for the next session.
 
 ## Status
 
