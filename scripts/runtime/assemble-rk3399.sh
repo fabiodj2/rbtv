@@ -13,8 +13,82 @@ DISPLAY=${DISPLAY:-$REPO/work/build/arm32/display}
 PROBE=${PROBE:-$REPO/work/probe/arm32/rx3-arm32-probe}
 RUNTIME=${RUNTIME:-$REPO/work/runtime/rx3}
 
-STOCK_SHA256=3f0a1a9c4d107fcb856eb59bd77b39139b239b111f431d40d11b5c7e66dffddb
-PLAYER_SHA256=11a6acdf51e776d01b2f01f16751dcc69712ed34e00d38ecd23ecef3d8ef91aa
+# Hashes vêm de scripts/runtime/versions.env (fonte única).
+. "$REPO/scripts/runtime/versions.env"
+
+# Exigir privilégio explícito: o tar do rootfs precisa ler arquivos root-only.
+if [ "$(id -u)" -ne 0 ]; then
+    echo "ERRO: execute como root (sudo sh $0)" >&2
+    echo "O tar do rootfs-stock precisa ler arquivos 0600 de root." >&2
+    exit 1
+fi
+
+# Rejeitar rootfs/player que não sejam ARM32 soft-float EABI5.
+check_arm32()
+{
+    file "$1" | grep -q 'ELF 32-bit LSB' || {
+        echo "ERRO: $1 não é ELF 32-bit" >&2
+        exit 1
+    }
+    file "$1" | grep -q 'ARM, EABI5' || {
+        echo "ERRO: $1 não é ARM EABI5" >&2
+        exit 1
+    }
+}
+
+check_arm32 "$ROOTFS/bin/busybox"
+check_arm32 "$PLAYER"
+
+# Validar GLIBC <= 2.7 e soft-float nos shims LD_PRELOAD.
+check_shim()
+{
+    so=$1
+    max=$(arm-linux-gnueabi-objdump -T "$so" 2>/dev/null |
+          grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)
+    case "$max" in
+        GLIBC_2.4|GLIBC_2.5|GLIBC_2.6|GLIBC_2.7|'')
+            ;;
+        *)
+            echo "ERRO: $so exige $max (> GLIBC_2.7)" >&2
+            exit 1
+            ;;
+    esac
+
+    if arm-linux-gnueabi-readelf -A "$so" | grep -q 'Tag_ABI_VFP_args'; then
+        echo "ERRO: $so é hard-float" >&2
+        exit 1
+    fi
+}
+
+# Checar que os .so são mais novos que os fontes correspondentes.
+check_fresh()
+{
+    so=$1
+    src=$2
+    [ -f "$src" ] || return 0
+    [ "$so" -nt "$src" ] || {
+        echo "ERRO: $so é mais antigo que $src; recompile" >&2
+        exit 1
+    }
+}
+
+# Explicação dos shims usados (os demais do rbtv são específicos de
+# hardware que não existe no RK3399 ou foram substituídos por ARM64 nativo):
+#   memshim.so   - redireciona mmap MAP_SHARED fd=-1 do rbp (obrigatório)
+#   audioshim.so - 4 canais ALSA para DDJ-400
+#   keyshim.so   - FIFO -> IKeyManager::sendKey, inicia pump do UiMain
+# Não usados aqui: knobshim2, fbshim16, fbshim-tsc, gpioshim, tscshim, crashcatch.
+
+for pair in \
+    "memshim.so:memshim.c" \
+    "audioshim.so:audioshim.c" \
+    "keyshim.so:keyshim.c"
+do
+    so=${pair%%:*}
+    src=${pair##*:}
+    check_shim "$SHIMS/$so"
+    check_fresh "$SHIMS/$so" "$REPO/scripts/rb/$src"
+done
 
 required="
 $ROOTFS/bin/busybox
@@ -77,8 +151,9 @@ tar     -C "$stage"     --no-same-owner     -xf "$archive"
 rm -f -- "$archive"
 archive=''
 
-# A chave descriptográfica não é necessária durante a execução do player.
-rm -f "$stage/usr/local/pdj/aes256.key"
+# aes256.key mantida por ora: não há evidência de que o player a abre em
+# runtime, mas também não há prova de que não abre. Remover somente depois de
+# confirmar empiricamente com o player rodando (ver AUDITORIA_RBTV_ORANGE_PI_4_LTS.md).
 
 # Remover somente artefatos temporários instalados durante os testes.
 rm -f \
