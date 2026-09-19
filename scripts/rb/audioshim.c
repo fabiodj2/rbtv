@@ -63,6 +63,7 @@ typedef long snd_pcm_sframes_t;
 #define SND_PCM_STREAM_PLAYBACK 0
 #define SND_PCM_STREAM_CAPTURE  1
 #define SND_PCM_ACCESS_RW_INTERLEAVED 3
+#define SND_PCM_FORMAT_S16_LE   2
 #define SND_PCM_FORMAT_S24_LE   6
 
 /* Virtual handles for secondary streams */
@@ -141,7 +142,7 @@ static void init_real_alsa(void)
 /* 4-channel audio buffer for Prime GO (S24_LE: 4 bytes per sample, 4 channels = 16 bytes/frame) */
 #define MAX_FRAMES 4096
 static int32_t g_mix4ch[MAX_FRAMES * 4];
-static int32_t g_out2ch[MAX_FRAMES * 2];   /* Chromebit: HDMI stereo (S24_LE) */
+static int16_t g_out4ch[MAX_FRAMES * 4];   /* DDJ-400: 4ch interleaved S16_LE */
 static unsigned long g_write_count = 0;
 
 /* ---- Startup mute / fade-in --------------------------------------------
@@ -156,14 +157,38 @@ static unsigned long long g_startup_frames_done = 0;
 static int g_startup_logged_mute = 0;
 static int g_startup_logged_open = 0;
 
+static long parse_env_ms(const char *name, long fallback)
+{
+    const char *s = getenv(name);
+    unsigned long value = 0;
+
+    if (!s || !*s)
+        return fallback;
+
+    while (*s >= '0' && *s <= '9') {
+        unsigned digit = (unsigned)(*s - '0');
+
+        if (value > 360000UL)
+            return 3600000L;
+
+        value = value * 10UL + digit;
+        s++;
+    }
+
+    if (*s != '\0')
+        return fallback;
+
+    if (value > 3600000UL)
+        value = 3600000UL;
+
+    return (long)value;
+}
+
 static void startup_env_init(void)
 {
     if (g_startup_mute_frames >= 0) return;
-    long mute_ms = 1500, fade_ms = 300;
-    const char *s = getenv("STARTUP_MUTE_MS");
-    if (s && *s) mute_ms = atol(s);
-    s = getenv("STARTUP_FADE_MS");
-    if (s && *s) fade_ms = atol(s);
+    long mute_ms = parse_env_ms("STARTUP_MUTE_MS", 1500);
+    long fade_ms = parse_env_ms("STARTUP_FADE_MS", 300);
     if (mute_ms < 0) mute_ms = 0;
     if (fade_ms < 0) fade_ms = 0;
     g_startup_mute_frames = mute_ms * 44100L / 1000L;
@@ -180,44 +205,34 @@ static float startup_gain(unsigned long long t, unsigned long long mute,
     return 1.0f;
 }
 
+
+static int16_t s24_to_s16(int32_t sample)
+{
+    if (sample > 8388607)
+        sample = 8388607;
+    else if (sample < -8388608)
+        sample = -8388608;
+
+    sample >>= 8;
+
+    if (sample > 32767)
+        sample = 32767;
+    else if (sample < -32768)
+        sample = -32768;
+
+    return (int16_t)sample;
+}
+
 static inline int is_real(snd_pcm_t *pcm)
 {
     return (pcm && pcm == g_real_playback);
 }
 
-/* Resolve the HDMI codec card by *name* instead of a fixed index.  Card
- * numbering is not stable: a USB audio device (e.g. a DDJ-400 left plugged in)
- * can enumerate before the platform ASoC card and take card 0, which would
- * silently route the mix to the controller instead of the TV.  Prefer a card
- * whose name mentions HDMI, fall back to the VEYRON platform card. */
-static int pick_hdmi_device(char *out, size_t n)
+/* Use ALSA's stable card identifier instead of the enumeration index. */
+static const char *audio_device(void)
 {
-    FILE *f = fopen("/proc/asound/cards", "r");
-    char line[256];
-    int card = -1, hdmi = -1, veyron = -1;
-
-    if (!f)
-        return 0;
-    while (fgets(line, sizeof(line), f)) {
-        int idx;
-        if (sscanf(line, " %d [", &idx) == 1) {
-            card = idx;
-            continue;
-        }
-        if (card < 0)
-            continue;
-        if (strstr(line, "HDMI") && hdmi < 0)
-            hdmi = card;
-        if (strstr(line, "VEYRON") && veyron < 0)
-            veyron = card;
-    }
-    fclose(f);
-    if (hdmi < 0)
-        hdmi = veyron;
-    if (hdmi < 0)
-        return 0;
-    snprintf(out, n, "hw:%d,0", hdmi);
-    return 1;
+    const char *configured = getenv("RX3_AUDIO_DEVICE");
+    return (configured && *configured) ? configured : "hw:CARD=DDJ400,DEV=0";
 }
 
 int snd_pcm_open(snd_pcm_t **pcm, const char *name, int stream, int mode)
@@ -227,19 +242,18 @@ int snd_pcm_open(snd_pcm_t **pcm, const char *name, int stream, int mode)
 
     if (stream == SND_PCM_STREAM_PLAYBACK) {
         if (g_playback_open_count == 0) {
-            /* Output 0: Master -> Real HDMI (resolved by card name, see above) */
+            /* Output 0: real DDJ-400 four-channel PCM. */
             if (!g_real_playback && real_snd_pcm_open) {
-                int real_mode = mode & ~2; /* mask out SND_PCM_NONBLOCK so hardware paces audio clock */
-                char dev[32];
-                const char *want = "hw:0,0";
-                if (pick_hdmi_device(dev, sizeof(dev)))
-                    want = dev;
-                int err = real_snd_pcm_open(&g_real_playback, want, SND_PCM_STREAM_PLAYBACK, real_mode);
-                alog("audioshim: opened real %s for Master (mode=%d->%d), res=%d handle=%p\n",
+                int real_mode = mode & ~2;
+                const char *want = audio_device();
+                int err = real_snd_pcm_open(&g_real_playback, want,
+                                            SND_PCM_STREAM_PLAYBACK, real_mode);
+                alog("audioshim: opened real %s for 4ch Master/Cue "
+                     "(mode=%d->%d), res=%d handle=%p\n",
                      want, mode, real_mode, err, g_real_playback);
-                if (err < 0) {
-                    err = real_snd_pcm_open(&g_real_playback, "default", SND_PCM_STREAM_PLAYBACK, real_mode);
-                    alog("audioshim: fallback open 'default' res=%d handle=%p\n", err, g_real_playback);
+                if (err < 0 || !g_real_playback) {
+                    g_real_playback = NULL;
+                    return err < 0 ? err : -ENODEV;
                 }
             }
             *pcm = g_real_playback;
@@ -307,10 +321,10 @@ int snd_pcm_hw_params_set_format(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, in
 {
     init_real_alsa();
     alog("audioshim: set_format req=%d\n", format);
-    /* Chromebit HDMI hw:0,0 is stereo and natively supports S24_LE (format 6) */
+    /* DDJ-400 hardware output is fixed at interleaved S16_LE. */
     if (is_real(pcm) && real_snd_pcm_hw_params_set_format) {
-        int err = real_snd_pcm_hw_params_set_format(g_real_playback, params, SND_PCM_FORMAT_S24_LE);
-        alog("audioshim: real set_format(S24_LE=6) res=%d\n", err);
+        int err = real_snd_pcm_hw_params_set_format(g_real_playback, params, SND_PCM_FORMAT_S16_LE);
+        alog("audioshim: real set_format(S16_LE=2) res=%d\n", err);
         return err;
     }
     return 0;
@@ -319,10 +333,10 @@ int snd_pcm_hw_params_set_format(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, in
 int snd_pcm_hw_params_set_channels(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int val)
 {
     init_real_alsa();
-    alog("audioshim: set_channels req=%u -> setting 2ch on hw\n", val);
+    alog("audioshim: set_channels req=%u -> setting 4ch on DDJ-400\n", val);
     if (is_real(pcm) && real_snd_pcm_hw_params_set_channels) {
-        int err = real_snd_pcm_hw_params_set_channels(g_real_playback, params, 2);
-        alog("audioshim: real set_channels(2) res=%d\n", err);
+        int err = real_snd_pcm_hw_params_set_channels(g_real_playback, params, 4);
+        alog("audioshim: real set_channels(4) res=%d\n", err);
         return err;
     }
     return 0;
@@ -545,17 +559,6 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
 
     g_write_count++;
     snd_pcm_sframes_t written = 0;
-    /* Chromebit: downmix the RX3 4-channel mix to HDMI stereo (S24_LE).
-     * Use the headphone/cue pair when it has audio, otherwise the master pair. */
-    for (snd_pcm_uframes_t i = 0; i < size; i++) {
-        if (s_has_hp_audio) {
-            g_out2ch[i * 2 + 0] = g_mix4ch[i * 4 + 2];
-            g_out2ch[i * 2 + 1] = g_mix4ch[i * 4 + 3];
-        } else {
-            g_out2ch[i * 2 + 0] = g_mix4ch[i * 4 + 0];
-            g_out2ch[i * 2 + 1] = g_mix4ch[i * 4 + 1];
-        }
-    }
     /* startup mute + fade-in over all output channels */
     startup_env_init();
     {
@@ -563,32 +566,40 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
         unsigned long long mute = (unsigned long long)g_startup_mute_frames;
         unsigned long long fade = (unsigned long long)g_startup_fade_frames;
         g_startup_frames_done += size;
-        if (mute > 0 && t0 < mute + fade) {
+        if ((mute > 0 || fade > 0) && t0 < mute + fade) {
             if (!g_startup_logged_mute) {
                 g_startup_logged_mute = 1;
-                alog("audioshim: startup mute active: %llu+%llu frames (~%.1fs)\n",
-                     mute, fade, (double)(mute + fade) / 44100.0);
+                alog("audioshim: startup mute active: %lu+%lu frames\n",
+                     (unsigned long)mute, (unsigned long)fade);
             }
             for (snd_pcm_uframes_t i = 0; i < size; i++) {
                 float g = startup_gain(t0 + i, mute, fade);
                 if (g >= 1.0f) continue;
-                for (int c = 0; c < 2; c++)
-                    g_out2ch[i * 2 + c] = (int32_t)((float)g_out2ch[i * 2 + c] * g);
+                for (int c = 0; c < 4; c++)
+                    g_mix4ch[i * 4 + c] = (int32_t)((float)g_mix4ch[i * 4 + c] * g);
             }
         }
-        if (!g_startup_logged_open && mute > 0 && g_startup_frames_done >= mute + fade) {
+        if (!g_startup_logged_open && (mute > 0 || fade > 0) && g_startup_frames_done >= mute + fade) {
             g_startup_logged_open = 1;
-            alog("audioshim: startup mute released after %llu frames\n", g_startup_frames_done);
+            alog("audioshim: startup mute released after %lu frames\n",
+                 (unsigned long)g_startup_frames_done);
         }
     }
 
-    /* Output stereo to real HDMI hardware */
+    /* Convert the RX3 S24_LE samples to DDJ-400 S16_LE, preserving:
+     * channels 0/1 = master and channels 2/3 = headphone cue. */
+    for (snd_pcm_uframes_t i = 0; i < size; i++) {
+        for (int c = 0; c < 4; c++)
+            g_out4ch[i * 4 + c] = s24_to_s16(g_mix4ch[i * 4 + c]);
+    }
+
+    /* Output four interleaved channels to the DDJ-400. */
     if (g_real_playback && real_snd_pcm_writei) {
-        written = real_snd_pcm_writei(g_real_playback, g_out2ch, size);
+        written = real_snd_pcm_writei(g_real_playback, g_out4ch, size);
         if (written < 0) {
             if (real_snd_pcm_prepare)
                 real_snd_pcm_prepare(g_real_playback);
-            written = real_snd_pcm_writei(g_real_playback, g_out2ch, size);
+            written = real_snd_pcm_writei(g_real_playback, g_out4ch, size);
         }
     } else {
         /* Safety sleep to pace real-time audio threads if hardware is delayed */
