@@ -42,20 +42,21 @@ check_arm32 "$PLAYER"
 # Validar GLIBC <= 2.7 e soft-float nos shims LD_PRELOAD.
 check_shim()
 {
-    so=$1
-    max=$(arm-linux-gnueabi-objdump -T "$so" 2>/dev/null |
+    local shim=$1
+    local max
+    max=$(arm-linux-gnueabi-objdump -T "$shim" 2>/dev/null |
           grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)
     case "$max" in
         GLIBC_2.4|GLIBC_2.5|GLIBC_2.6|GLIBC_2.7|'')
             ;;
         *)
-            echo "ERRO: $so exige $max (> GLIBC_2.7)" >&2
+            echo "ERRO: $shim exige $max (> GLIBC_2.7)" >&2
             exit 1
             ;;
     esac
 
-    if arm-linux-gnueabi-readelf -A "$so" | grep -q 'Tag_ABI_VFP_args'; then
-        echo "ERRO: $so é hard-float" >&2
+    if arm-linux-gnueabi-readelf -A "$shim" | grep -q 'Tag_ABI_VFP_args'; then
+        echo "ERRO: $shim é hard-float" >&2
         exit 1
     fi
 }
@@ -63,11 +64,11 @@ check_shim()
 # Checar que os .so são mais novos que os fontes correspondentes.
 check_fresh()
 {
-    so=$1
-    src=$2
-    [ -f "$src" ] || return 0
-    [ "$so" -nt "$src" ] || {
-        echo "ERRO: $so é mais antigo que $src; recompile" >&2
+    local shim=$1
+    local source=$2
+    [ -f "$source" ] || return 0
+    [ "$shim" -nt "$source" ] || {
+        echo "ERRO: $shim é mais antigo que $source; recompile" >&2
         exit 1
     }
 }
@@ -84,10 +85,10 @@ for pair in \
     "audioshim.so:audioshim.c" \
     "keyshim.so:keyshim.c"
 do
-    so=${pair%%:*}
-    src=${pair##*:}
-    check_shim "$SHIMS/$so"
-    check_fresh "$SHIMS/$so" "$REPO/scripts/rb/$src"
+    shim_name=${pair%%:*}
+    source_name=${pair##*:}
+    check_shim "$SHIMS/$shim_name"
+    check_fresh "$SHIMS/$shim_name" "$REPO/scripts/rb/$source_name"
 done
 
 required="
