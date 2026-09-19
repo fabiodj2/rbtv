@@ -13,8 +13,8 @@
     "model": "XDJ-RX3",
     "version": "1.20",
     "stock_player_md5_legacy": "4f2efcfc0c9e3f539289f863acfddcc6",
-    "stock_player_sha256": null,
-    "sha256_status": "awaiting-local-verification"
+    "stock_player_sha256": "3f0a1a9c4d107fcb856eb59bd77b39139b239b111f431d40d11b5c7e66dffddb",
+    "sha256_status": "verified-from-official-rx3-1.20"
   },
   "upstreams": {
     "rbtv": "4ce92254df52c8a3a5ac62801555503be68e9782",
