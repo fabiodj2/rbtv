@@ -33,3 +33,7 @@ images/*.sha256
 *.o
 *.log
 *.tmp
+
+# Python test cache
+__pycache__/
+*.pyc
