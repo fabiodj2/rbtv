@@ -17,6 +17,8 @@ git rev-parse backup/functional-2026-09-22
 git log --oneline backup/functional-2026-09-22..HEAD
 sh scripts/rb/runtime/tests/test-runtime.sh
 python3 -m unittest discover -s scripts/rb/runtime/tests -p 'test_*.py' -v
+# Or run the complete suite:
+sh scripts/rb/runtime/tests/run-all.sh
 ```
 
 Expect the baseline hash shown above and six patch manager tests passing. `git diff --name-status backup/functional-2026-09-22...HEAD` shows the newly added integration files; existing launcher and shims should remain unchanged.
@@ -31,6 +33,10 @@ file "$RBP_STOCK"
 sha1sum "$RBP_STOCK"
 sha256sum "$RBP_STOCK"
 cp scripts/rb/runtime/patches/beatjump-rx3-1.19.candidate.json "$HOME/rx3-private/beatjump-reviewed.json"
+python3 scripts/rb/runtime/inspect-rbp.py \
+  --rbp "$RBP_STOCK" \
+  --manifest scripts/rb/runtime/patches/beatjump-rx3-1.19.candidate.json \
+  --json > "$HOME/rx3-private/rbp-compatibility.json" || true
 python3 - "$RBP_STOCK" "$HOME/rx3-private/beatjump-reviewed.json" <<'PY'
 import json, pathlib, sys
 binary = pathlib.Path(sys.argv[1]).read_bytes()
@@ -41,6 +47,11 @@ for patch in spec['patches']:
     print(f"{o:8d} {patch['label']}: expected={before.hex()} actual={actual.hex()} match={actual == before}")
 PY
 ```
+
+The inspector is read-only. With the repository's candidate manifest it is
+expected to return status 1 because `source_sha1` is intentionally empty. Its
+JSON report still records the binary hash and every matching or mismatching
+guard, providing the evidence needed for review without approving deployment.
 
 If any entry says `match=False`, **stop**: identify the matching instruction and surrounding function for that exact firmware and architecture before preparing a new manifest. Matching bytes alone is necessary but does not prove equivalent code behavior. Compare disassembly and verify the binary's ARM mode, firmware lineage, load layout, display assets, and current crashguard patches. The upstream 1.19 hash list is not a substitute for the hash of the exact stock input being patched.
 
