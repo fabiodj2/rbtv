@@ -1,0 +1,14 @@
+name: RX3 runtime safety
+
+on:
+  push:
+    branches: [feature/rx3-toolkit-runtime]
+  pull_request:
+
+jobs:
+  safety-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run isolated runtime tests
+        run: sh scripts/rb/runtime/tests/run-all.sh
