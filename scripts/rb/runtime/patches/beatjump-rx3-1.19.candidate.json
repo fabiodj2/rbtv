@@ -1,0 +1,20 @@
+{
+  "source_sha1": "",
+  "origin": "Tratosca/rx3-toolkit mod/modules/beatjump-32bars/1.19/module.sh and beatjump-no-quantize/1.19/module.sh",
+  "status": "CANDIDATE_ONLY: no RX3 1.19 binary verified for this target",
+  "patches": [
+    {"offset": 393376, "before": "c88ab7ee", "after": "c88ab0ee", "label": "guard vcvt"},
+    {"offset": 393380, "before": "088b38ee", "after": "087a78ee", "label": "guard vadd"},
+    {"offset": 393384, "before": "c87bfcee", "after": "e77afcee", "label": "guard vcvt u32"},
+    {"offset": 393600, "before": "008ab2ee", "after": "c254a0e3", "label": "negative jump"},
+    {"offset": 393604, "before": "c154a0e3", "after": "105a08ee", "label": "negative guard"},
+    {"offset": 393612, "before": "008ab2ee", "after": "4254a0e3", "label": "positive jump"},
+    {"offset": 393616, "before": "105a18ee", "after": "105a08ee", "label": "positive guard"},
+    {"offset": 5016772, "before": "10000000", "after": "40000000", "label": "LED threshold"},
+    {"offset": 5367248, "before": "f2130000", "after": "03140000", "label": "PAD7 off"},
+    {"offset": 5367224, "before": "f3130000", "after": "04140000", "label": "PAD7 on"},
+    {"offset": 5367188, "before": "f4130000", "after": "03140000", "label": "PAD8 off"},
+    {"offset": 5367164, "before": "f5130000", "after": "04140000", "label": "PAD8 on"},
+    {"offset": 695764, "before": "3d00000a", "after": "0000a0e1", "label": "direct Beat Jump"}
+  ]
+}
