@@ -1,0 +1,42 @@
+{
+  "name": "RK3399 DDJ-400 KEY + neural STEMS functional baseline",
+  "date": "2026-09-23",
+  "toolkit_commit": "0cb402e03d0c32d9bcc6c6fb8b8b4f40728e816a",
+  "runtime": {
+    "rbp_sha1": "ba846839215826fb90bd5a49e086d827273e3357",
+    "core_sha1": "86525231605dfe3656350ba1695656c5a7461723",
+    "bridge_sha1": "2ffd36f7dd0518715fac86a608163b448e89cd6f"
+  },
+  "features": {
+    "keyshift": true,
+    "stems_format": "RX3STM2",
+    "stems_controls": [
+      "DRUMS",
+      "VOCAL",
+      "INST"
+    ],
+    "ddj_mode": "PAD FX 2",
+    "ddj_pads": {
+      "1": "DRUMS",
+      "2": "VOCAL",
+      "3": "INST"
+    },
+    "bidirectional_led_sync": true,
+    "default_mode": "all parts active"
+  },
+  "assets": {
+    "rx3-stems-drums-on.rgb565": {
+      "bytes": 18000,
+      "sha1": "7ead14cdc19246d74db7c48feb8b7fa061f187b1"
+    },
+    "rx3-stems-inst-on.rgb565": {
+      "bytes": 18000,
+      "sha1": "6812033f9ffd5c2d6f72ac57051e520d22405678"
+    },
+    "rx3-stems-vocal-on.rgb565": {
+      "bytes": 18000,
+      "sha1": "7ead14cdc19246d74db7c48feb8b7fa061f187b1"
+    }
+  },
+  "private_binary_policy": "Proprietary RBP and compiled runtime binaries remain outside Git."
+}

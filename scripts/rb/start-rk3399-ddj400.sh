@@ -190,7 +190,9 @@ nohup sudo chroot "$RUNTIME" env \
     RX3_TOUCH_BRIDGE=1 \
     RX3_AUDIO_DEVICE='hw:CARD=DDJ400,DEV=0' \
     RX3_HP_GAIN_X="$HP_GAIN" \
-    LD_PRELOAD=/usr/lib/memshim.so:/usr/lib/fbshim.so:/usr/lib/audioshim.so:/usr/lib/keyshim.so:/usr/lib/netshim.so \
+    RX3_KEYSHIFT=1 \
+    RX3_STEMS_DIR=/root/pdj/RX3_STEMS \
+    LD_PRELOAD=/root/pdj/librx3_core.so:/usr/lib/memshim.so:/usr/lib/fbshim.so:/usr/lib/audioshim.so:/usr/lib/keyshim.so:/usr/lib/netshim.so \
     /lib/ld-linux.so.3 /root/pdj/rbp -a \
     >"$LOGDIR/rbp.log" 2>&1 </dev/null &
 

@@ -64,6 +64,7 @@
 #define K_BACK        0x420d
 #define K_LOAD        0x4311   /* + deck channel */
 #define K_PLAY        0x4101
+#define K_QUANTIZE   0x410b
 #define K_CUE         0x4102
 #define K_VINYL      0x4104
 #define K_SYNC        0x4112
@@ -434,6 +435,8 @@ static void pad_select_bank(int deck, int ddj_mode)
                rx3_bank, key);
 }
 
+static void stems_pad_send_command(int deck, int control);
+
 static void handle_pad(int deck, int note, int on, int shifted)
 {
     int mode = (note >> 4) & 0x0f;
@@ -446,6 +449,14 @@ static void handle_pad(int deck, int note, int on, int shifted)
 
     if (idx > 7 || mode > 7)
         return;
+
+    /* PAD FX 2 is the dedicated DDJ STEMS page. Pads 1-3 mirror the
+       touchscreen DRUMS/VOCAL/INST controls; pads 4-8 remain reserved. */
+    if (mode == 5) {
+        if (on && idx < 3)
+            stems_pad_send_command(deck, idx);
+        return;
+    }
 
     pad_select_bank(deck, mode);
 
@@ -510,6 +521,10 @@ static const struct notemap notemap[] = {
     { MC_MIXER, 0x68, K_SOURCE,   CH_GLOBAL, "SHIFT+LOAD 1 (source/usb)" },
     { MC_MIXER, 0x7A, K_MENU,     CH_GLOBAL, "SHIFT+LOAD 2 (menu)" },
     /* DECK transport / loops (deck channel) */
+    { MC_DECK1, 0x68, K_QUANTIZE, 0,
+      "SHIFT+CHANNEL CUE 1 -> QUANTIZE deck 1" },
+    { MC_DECK2, 0x68, K_QUANTIZE, 0,
+      "SHIFT+CHANNEL CUE 2 -> QUANTIZE deck 2" },
     { MC_DECK1, 0x0B, K_PLAY, 0, "PLAY/PAUSE" },
     { MC_DECK2, 0x0B, K_PLAY, 0, "PLAY/PAUSE" },
     { MC_DECK1, 0x47, K_REV,  0, "SHIFT+PLAY (censor)" },
@@ -895,6 +910,109 @@ static uint16_t native_led_last_sequence;
 static unsigned char native_led_hotcue[2] = { 0xff, 0xff };
 static int native_led_force_sync = 1;
 
+
+/* Bidirectional state transport shared with librx3_core.so inside the chroot. */
+#define STEMS_PAD_COMMAND_MAGIC 0x53434d44u
+#define STEMS_PAD_STATE_MAGIC   0x53544d53u
+
+struct stems_pad_command_packet {
+    uint32_t magic;
+    uint32_t sequence;
+    uint8_t deck;
+    uint8_t control;
+    uint16_t reserved;
+};
+
+struct stems_pad_state_packet {
+    uint32_t magic;
+    uint32_t sequence;
+    uint8_t active[2];
+    uint8_t armed[2];
+};
+
+static char stems_pad_command_path[512];
+static char stems_pad_state_path[512];
+static int stems_pad_command_fd = -1;
+static int stems_pad_state_fd = -1;
+static uint32_t stems_pad_command_sequence;
+static uint32_t stems_pad_state_sequence;
+
+static void stems_pad_sibling_path(char *output, size_t capacity,
+                                   const char *name)
+{
+    const char *slash = strrchr(fifo_path, '/');
+    if (slash) {
+        size_t length = (size_t)(slash - fifo_path);
+        if (length > capacity - strlen(name) - 2u)
+            length = capacity - strlen(name) - 2u;
+        snprintf(output, capacity, "%.*s/%s",
+                 (int)length, fifo_path, name);
+    } else {
+        snprintf(output, capacity, "%s", name);
+    }
+}
+
+static void stems_pad_init_paths(void)
+{
+    stems_pad_sibling_path(stems_pad_command_path,
+                           sizeof(stems_pad_command_path),
+                           "rx3-stems-pad-command.bin");
+    stems_pad_sibling_path(stems_pad_state_path,
+                           sizeof(stems_pad_state_path),
+                           "rx3-stems-pad-state.bin");
+    if (opt_verbose) {
+        logmsg("ddj400: STEMS command %s\n", stems_pad_command_path);
+        logmsg("ddj400: STEMS state %s\n", stems_pad_state_path);
+    }
+}
+
+static void stems_pad_send_command(int deck, int control)
+{
+    struct stems_pad_command_packet packet;
+    if (stems_pad_command_fd < 0)
+        stems_pad_command_fd = open(stems_pad_command_path,
+                                    O_RDWR | O_CREAT, 0644);
+    if (stems_pad_command_fd < 0)
+        return;
+    memset(&packet, 0, sizeof(packet));
+    packet.magic = STEMS_PAD_COMMAND_MAGIC;
+    packet.sequence = ++stems_pad_command_sequence;
+    packet.deck = (uint8_t)deck;
+    packet.control = (uint8_t)control;
+    (void)pwrite(stems_pad_command_fd, &packet, sizeof(packet), 0);
+    if (opt_verbose)
+        logmsg("  STEMS deck%d %s toggle\n", deck + 1,
+               control == 0 ? "DRUMS" :
+               control == 1 ? "VOCAL" : "INST");
+}
+
+static void stems_pad_state_tick(int midi_fd)
+{
+    struct stems_pad_state_packet packet;
+    if (stems_pad_state_fd < 0)
+        stems_pad_state_fd = open(stems_pad_state_path,
+                                  O_RDONLY | O_NONBLOCK);
+    if (stems_pad_state_fd < 0)
+        return;
+    if (pread(stems_pad_state_fd, &packet, sizeof(packet), 0) !=
+            (ssize_t)sizeof(packet) ||
+        packet.magic != STEMS_PAD_STATE_MAGIC ||
+        packet.sequence == stems_pad_state_sequence)
+        return;
+    stems_pad_state_sequence = packet.sequence;
+    for (int deck = 0; deck < 2; deck++) {
+        int channel = deck == 0 ? MC_PAD1 : MC_PAD2;
+
+        for (int control = 0; control < 3; control++)
+            led_send(midi_fd, channel, 0x50 + control,
+                     packet.armed[deck] &&
+                     (packet.active[deck] & (1u << control)) ? 0x7f : 0);
+    }
+    if (opt_verbose)
+        logmsg("  STEMS LEDs deck1=0x%02x deck2=0x%02x\n",
+               packet.active[0], packet.active[1]);
+}
+
 static void native_led_state_init_path(void)
 {
     const char *slash = strrchr(fifo_path, '/');
@@ -1105,6 +1223,11 @@ static void led_handle_input(int fd, int channel, int note, int on)
         int idx = note & 0x0f;
 
         if (idx > 7 || mode > 7)
+            return;
+
+        /* O transporte de estado STEMS é o único proprietário destes LEDs.
+           Não permita que o release físico sobrescreva o estado confirmado. */
+        if (mode == 5)
             return;
 
         /* SHIFT+PAD em Hot Cue: apagar o LED persistente. */
@@ -1402,6 +1525,7 @@ int main(int argc, char **argv)
 
     vu_init_path();
     native_led_state_init_path();
+    stems_pad_init_paths();
 
     /* Hot-plug friendly: keep waiting for the controller instead of dying,
      * so the bridge can be started before the DDJ-400 is plugged in. */
@@ -1448,6 +1572,7 @@ static void run_device(int fd)
             jog_tick();
             vu_tick(fd);
             native_led_state_tick(fd);
+            stems_pad_state_tick(fd);
             pad_led_tick(fd);
             continue;
         }
@@ -1491,6 +1616,7 @@ static void run_device(int fd)
         jog_tick();
         vu_tick(fd);
             native_led_state_tick(fd);
+            stems_pad_state_tick(fd);
             pad_led_tick(fd);
     }
     return;
