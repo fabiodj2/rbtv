@@ -29,3 +29,10 @@ O overlay em
 `scripts/rb/runtime/overlays/rk3399-key-stems-0cb402e0`
 contém as fontes CORE/STEMS, testes, assets RGB565 e o gerador RX3STM2
 usados no baseline validado.
+
+## LEDs PLAY/CUE
+
+- PLAY permanece aceso durante reprodução.
+- PLAY pisca durante pausa ou espera no CUE.
+- CUE permanece aceso quando existe uma faixa carregada.
+- O estado é reafirmado a cada 500 ms para evitar divergência local da DDJ-400.

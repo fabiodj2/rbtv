@@ -908,6 +908,8 @@ static char native_led_state_path[512];
 static int native_led_state_fd = -1;
 static uint16_t native_led_last_sequence;
 static unsigned char native_led_hotcue[2] = { 0xff, 0xff };
+static unsigned char native_led_cue[2] = { 0xff, 0xff };
+static long long native_led_transport_refresh = -1;
 static int native_led_force_sync = 1;
 
 
@@ -1107,6 +1109,39 @@ static void native_led_state_tick(int midi_fd)
         }
     }
 
+    /* Estados nativos observados no player:
+       2/3 = tocando, 4 = pausa, 6 = parado no CUE, 7 = CUE preview.
+       PLAY permanece aceso tocando e pisca em estados pausados. */
+    long long current_ms = now_ms();
+    int blink = (int)((current_ms / 400) & 1);
+    long long refresh_slot = current_ms / 500;
+    int force_transport =
+        refresh_slot != native_led_transport_refresh;
+
+    for (int deck = 0; deck < 2; deck++) {
+        int mode = packet.play_mode[deck];
+        int loaded =
+            packet.total_time[deck] != 0xffffffffu &&
+            packet.total_time[deck] != 0u;
+        int playing = mode == 2 || mode == 3;
+        int paused = mode == 4 || mode == 6;
+        int play_led = playing ? 1 : (paused ? blink : 0);
+        int cue_led = loaded ? 1 : 0;
+
+        if (native_led_force_sync || force_transport ||
+            led_play[deck] != play_led) {
+            led_play[deck] = (unsigned char)play_led;
+            led_send(midi_fd, deck, 0x0b, play_led);
+        }
+
+        if (native_led_force_sync || force_transport ||
+            native_led_cue[deck] != (unsigned char)cue_led) {
+            native_led_cue[deck] = (unsigned char)cue_led;
+            led_send(midi_fd, deck, 0x0c, cue_led);
+        }
+    }
+
+    native_led_transport_refresh = refresh_slot;
     native_led_force_sync = 0;
 }
 
@@ -1297,18 +1332,8 @@ static void led_handle_input(int fd, int channel, int note, int on)
 
         switch (note) {
         case 0x0b: /* PLAY/PAUSE */
-            if (on) {
-                led_play[deck] ^= 1;
-                led_send(fd, deck, note, led_play[deck]);
-            }
-            return;
-
         case 0x0c: /* CUE */
-            if (on) {
-                led_play[deck] = 0;
-                led_send(fd, deck, 0x0b, 0);
-            }
-            led_send(fd, deck, note, on);
+            /* O estado real do player é o único proprietário destes LEDs. */
             return;
 
         case 0x58: /* BEAT SYNC */

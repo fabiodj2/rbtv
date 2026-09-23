@@ -5,7 +5,7 @@
   "runtime": {
     "rbp_sha1": "ba846839215826fb90bd5a49e086d827273e3357",
     "core_sha1": "86525231605dfe3656350ba1695656c5a7461723",
-    "bridge_sha1": "2ffd36f7dd0518715fac86a608163b448e89cd6f"
+    "bridge_sha1": "77620611e057a92752813520a5ee1684f3360187"
   },
   "features": {
     "keyshift": true,
@@ -22,7 +22,16 @@
       "3": "INST"
     },
     "bidirectional_led_sync": true,
-    "default_mode": "all parts active"
+    "default_mode": "all parts active",
+    "native_play_cue_leds": true,
+    "play_led_behavior": {
+      "playing": "steady",
+      "paused_or_cued": "blink_400ms"
+    },
+    "cue_led_behavior": {
+      "track_loaded": "steady",
+      "refresh": "500ms"
+    }
   },
   "assets": {
     "rx3-stems-drums-on.rgb565": {
