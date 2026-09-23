@@ -25,6 +25,7 @@ RX3=${RX3:-$RBX3/XDJRX3-rootfs}
 DFBDIFF=${DFBDIFF:-$PRIMEBOX/tools/build-directfb/directfb-full.diff}
 OURPATCH=$REPO/scripts/rb/directfb-chromebit.patch
 NEONPATCH=$REPO/scripts/rb/directfb-chromebit-neon.patch
+MAPFIX=$REPO/scripts/rb/directfb-rk3399-mapfix.patch
 SYS=${SYS:-/tmp/arm213sysroot}
 BUILD=${BUILD:-/tmp/dfb}
 OUT=${OUT:-$REPO/work/rb/dfb}
@@ -33,6 +34,7 @@ OUT=${OUT:-$REPO/work/rb/dfb}
 [ -f "$DFBDIFF" ] || { echo "PrimeBox diff not found: $DFBDIFF"; exit 1; }
 [ -f "$OURPATCH" ]|| { echo "our patch not found: $OURPATCH"; exit 1; }
 [ -f "$NEONPATCH" ]|| { echo "NEON patch not found: $NEONPATCH"; exit 1; }
+[ -f "$MAPFIX" ]  || { echo "RK3399 mapfix not found: $MAPFIX"; exit 1; }
 
 echo "== 1. soft-float sysroot ($SYS)"
 sudo rm -rf "$SYS"
@@ -54,6 +56,7 @@ git checkout -q origin/directfb-1.4        # == 1.4.16
 patch -p1 --quiet < "$DFBDIFF"
 patch -p1 --quiet < "$OURPATCH"
 patch -p1 --quiet < "$NEONPATCH"
+patch -p1 --quiet < "$MAPFIX"
 printf 'int dfb_fbdev_compat_shim(void){return 0;}\n' > systems/fbdev/compat_shim.c
 
 echo "== 3. configure"

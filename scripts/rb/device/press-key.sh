@@ -33,7 +33,7 @@ case "$KEY" in
     *)       K=$1 ;;
 esac
 
-FIFO=/tmp/rb-keys.fifo
+FIFO="${RB_CTRL_FIFO:-/tmp/rb-keys.fifo}"
 [ -p "$FIFO" ] || { echo "no $FIFO — is rbp running (start-rb.sh)?" >&2; exit 1; }
 
 le32() {

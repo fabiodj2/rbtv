@@ -27,6 +27,7 @@
 #include <stdint.h>
 #include <time.h>
 #include <sys/syscall.h>
+#include <sys/mman.h>
 
 static int real_open(const char *p, int flags)
 {
@@ -170,15 +171,58 @@ static void mixer_route(void)
     *(volatile unsigned int *)MIX_ROUTE_CH2 = MIX_ROUTE_PLAYER1;
 }
 
+/* Native DjEngineIF instance and crossfader assignment.
+ * Assignment 0 bypasses the crossfader.  The RX3 panel normally initializes
+ * input 0 as A and input 1 as B; without the panel both remain bypassed. */
+#define DJ_ENGINE_GLOBAL            0x0268617cUL
+#define FN_SET_CROSSFADER_ASSIGN    0x004cc0cUL
+
+static int mixer_crossfader_assign(void)
+{
+    void *engine = *(void * volatile *)DJ_ENGINE_GLOBAL;
+    void (*set_assign)(void *, int, int);
+
+    if (!engine)
+        return 0;
+
+    set_assign = (void (*)(void *, int, int))
+                 FN_SET_CROSSFADER_ASSIGN;
+
+    set_assign(engine, 0, 1); /* mixer input 0 / deck 1 -> A */
+    set_assign(engine, 1, 2); /* mixer input 1 / deck 2 -> B */
+
+    klog_str("keyshim: crossfader assigned deck1=A deck2=B\n");
+    return 1;
+}
+
 /* Without the RX3 sub-microcontroller the mixer controls have no physical
  * position, so the engine keeps its defaults — channel faders 0.0 (= silence)
  * and the crossfader hard left.  Push sane defaults once the KeyManager is up
  * (same idea as the Prime GO knobshim2 mixer init, SESSION_STATE_12).
  * keycodes: FADER 0x501e, TRIM 0x5019, EQH/M/L 0x501a/b/c, XFADER 0x6017. */
+
+/* Seleciona diretamente o FILTER nativo nos dois canais.
+ * O painel original do RX3 faria esta inicialização. */
+static int rx3_native_filter_select(void)
+{
+    void *engine = *(void *volatile *)0x0268617cUL;
+
+    if (!engine)
+        return 0;
+
+    ((void (*)(void *, int, int))0x004e2c4UL)(engine, 0, 1);
+    ((void (*)(void *, int, int))0x004e2c4UL)(engine, 1, 1);
+
+    klog_str("keyshim: native FILTER selected deck1/deck2\n");
+    return 1;
+}
+
 static void mixer_defaults(void)
 {
+    rx3_native_filter_select();
     int ch;
     mixer_route();  /* re-assert Input 0->deck1, Input 1->deck2 */
+    mixer_crossfader_assign();
     for (ch = 1; ch <= 2; ch++) {
         send_rx_key_fl(0x501e, OP_ROTATE, ch, 1023, 1.0f, 0); /* channel fader up */
         send_rx_key_fl(0x5019, OP_ROTATE, ch, 512, 0.5f, 0);  /* trim center */
@@ -186,7 +230,7 @@ static void mixer_defaults(void)
         send_rx_key_fl(0x501b, OP_ROTATE, ch, 512, 0.5f, 0);  /* MID */
         send_rx_key_fl(0x501c, OP_ROTATE, ch, 512, 0.5f, 0);  /* LOW */
     }
-    send_rx_key_fl(0x6017, OP_ROTATE, 1, 512, 0.5f, 0);       /* crossfader center */
+    send_rx_key_fl(0x6017, OP_ROTATE, 0, 512, 0.5f, 0);       /* crossfader center */
 }
 
 /* ---- PanelComPeer "UiMain" message-pump thread ----
@@ -279,6 +323,379 @@ struct ctrl_ev {
     int32_t l;
 };
 
+/* ---- native pad-bank adapter ---- */
+#define RX3_NATIVE_PAD_MODE_GETTER 0x000fd3ccUL
+#define RX3_NATIVE_PAD_SELECTOR    0x4113
+
+static unsigned char rx3_pad_held[2][8];
+
+static int rx3_native_pad_mode(int deck)
+{
+    int (*get_mode)(int) =
+        (int (*)(int))RX3_NATIVE_PAD_MODE_GETTER;
+
+    if (deck < 0 || deck > 1)
+        return -1;
+
+    return get_mode(deck);
+}
+
+static int rx3_select_pad_bank(int deck, int target)
+{
+    int current;
+    int expected;
+    int tries;
+
+    if (deck < 0 || deck > 1 || target < 0 || target > 7)
+        return 0;
+
+    current = rx3_native_pad_mode(deck);
+
+    if (current == target)
+        return 1;
+
+    if (current < 0 || current > 7)
+        return 0;
+
+    expected = (current % 4 == target % 4)
+        ? (current ^ 4)
+        : (target % 4);
+
+    send_rx_key_fl(
+        RX3_NATIVE_PAD_SELECTOR + target % 4,
+        OP_PRESS,
+        deck + 1,
+        0, 0.0f, 0
+    );
+
+    send_rx_key_fl(
+        RX3_NATIVE_PAD_SELECTOR + target % 4,
+        OP_RELEASE,
+        deck + 1,
+        0, 0.0f, 0
+    );
+
+    for (tries = 0; tries < 25; tries++) {
+        usleep(10000);
+
+        if (rx3_native_pad_mode(deck) == expected)
+            break;
+    }
+
+    if (rx3_native_pad_mode(deck) != expected)
+        return 0;
+
+    if (expected != target) {
+        send_rx_key_fl(
+            RX3_NATIVE_PAD_SELECTOR + target % 4,
+            OP_PRESS,
+            deck + 1,
+            0, 0.0f, 0
+        );
+
+        send_rx_key_fl(
+            RX3_NATIVE_PAD_SELECTOR + target % 4,
+            OP_RELEASE,
+            deck + 1,
+            0, 0.0f, 0
+        );
+
+        for (tries = 0; tries < 25; tries++) {
+            usleep(10000);
+
+            if (rx3_native_pad_mode(deck) == target)
+                break;
+        }
+    }
+
+    return rx3_native_pad_mode(deck) == target;
+}
+
+static int rx3_handle_tagged_pad(const struct ctrl_ev *ev)
+{
+    int deck;
+    int pad;
+    int bank;
+    unsigned char *held;
+
+    if ((ev->l & ~7L) != 0x5040L)
+        return 0;
+
+    if (ev->key < 0x4117 || ev->key > 0x411e)
+        return 0;
+
+    if (ev->ch < 1 || ev->ch > 2)
+        return 0;
+
+    if (ev->op != OP_PRESS && ev->op != OP_RELEASE)
+        return 0;
+
+    deck = ev->ch - 1;
+    pad = ev->key - 0x4117;
+    bank = (int)(ev->l & 7L);
+    held = &rx3_pad_held[deck][pad];
+
+    if (ev->op == OP_PRESS) {
+        if (*held == (unsigned char)(bank + 1))
+            return 1;
+
+        if (!rx3_select_pad_bank(deck, bank))
+            return 1;
+
+        *held = (unsigned char)(bank + 1);
+
+        send_rx_key_fl(
+            ev->key, ev->op, ev->ch,
+            ev->param, ev->f, 0
+        );
+
+        return 1;
+    }
+
+    if (*held != (unsigned char)(bank + 1))
+        return 1;
+
+    *held = 0;
+
+    if (rx3_native_pad_mode(deck) != bank)
+        return 1;
+
+    send_rx_key_fl(
+        ev->key, ev->op, ev->ch,
+        ev->param, ev->f, 0
+    );
+
+    return 1;
+}
+
+
+
+/* ---- Native touchscreen Performance Pads -----------------------------
+ *
+ * The stock RX3 draws pad labels but does not treat those labels as touch
+ * buttons. Intercept only their logical 1280x800 rectangles and translate
+ * them to the same native pad keys used by the physical panel.
+ */
+struct rx3_touch_event {
+    uint8_t down;
+    uint8_t padding[3];
+    int x;
+    int y;
+};
+
+typedef void (*rx3_touch_fn)(
+    void *handler,
+    const struct rx3_touch_event *touch,
+    void *mode
+);
+
+static rx3_touch_fn rx3_original_touch;
+static int rx3_touch_held_key;
+static int rx3_touch_held_channel;
+
+static int rx3_player_screen_active(void)
+{
+    void *active =
+        *(void * volatile *)(0x024942bcUL + 0x20);
+
+    return active &&
+        *(volatile int16_t *)((char *)active + 6) == 0;
+}
+
+static int rx3_main_panel_visible(void)
+{
+    uintptr_t panel;
+
+    if (!rx3_player_screen_active())
+        return 0;
+
+    panel = *(volatile uint32_t *)0x0245b880UL;
+
+    for (int index = 0; panel && index < 256; index++) {
+        if (*(volatile uint32_t *)(panel + 0x0c) == 136)
+            return
+                (*(volatile uint32_t *)(panel + 4) & 8) != 0;
+
+        panel = *(volatile uint32_t *)(panel + 0x84);
+    }
+
+    return 0;
+}
+
+static void rx3_native_pad_touch(
+    void *handler,
+    const struct rx3_touch_event *touch,
+    void *mode)
+{
+    int key = 0;
+    int channel = 0;
+
+    if (rx3_touch_held_key) {
+        if (!touch->down) {
+            send_rx_key(
+                rx3_touch_held_key,
+                OP_RELEASE,
+                rx3_touch_held_channel
+            );
+
+            klog_hex(
+                "keyshim: touch pad release=",
+                (unsigned)rx3_touch_held_key
+            );
+
+            rx3_touch_held_key = 0;
+            rx3_touch_held_channel = 0;
+        }
+
+        return;
+    }
+
+    if (touch->down &&
+        !*((uint8_t *)handler + 4) &&
+        rx3_main_panel_visible()) {
+        /*
+         * Native pad-mode selectors:
+         * logical y 492..517, four columns per deck.
+         */
+        if (touch->y >= 492 && touch->y < 518 &&
+            touch->x >= 0 && touch->x < 1280) {
+            int deck = touch->x / 640;
+            int local = touch->x % 640 - 10;
+            int column = local >= 0 ? local / 158 : -1;
+
+            if (column >= 0 && column < 4 &&
+                local % 158 < 150) {
+                key = 0x4113 + column;
+                channel = deck + 1;
+            }
+        }
+
+        /*
+         * Native performance pads:
+         * row 1: logical y 518..540, pads 1..4
+         * row 2: logical y 548..570, pads 5..8
+         */
+        if (!key) {
+            int row =
+                touch->y >= 518 && touch->y <= 540 ? 0 :
+                touch->y >= 548 && touch->y <= 570 ? 1 : -1;
+
+            int deck =
+                touch->x >= 0 && touch->x < 1280
+                    ? touch->x / 640 : -1;
+
+            int local =
+                deck >= 0 ? touch->x % 640 - 10 : -1;
+
+            int column =
+                local >= 0 ? local / 158 : -1;
+
+            if (row >= 0 &&
+                deck >= 0 && deck < 2 &&
+                column >= 0 && column < 4 &&
+                local % 158 < 150) {
+                key = 0x4117 + row * 4 + column;
+                channel = deck + 1;
+            }
+        }
+
+        if (key) {
+            rx3_touch_held_key = key;
+            rx3_touch_held_channel = channel;
+
+            send_rx_key(key, OP_PRESS, channel);
+
+            klog_hex(
+                "keyshim: touch pad press=",
+                (unsigned)key
+            );
+
+            return;
+        }
+    }
+
+    rx3_original_touch(handler, touch, mode);
+}
+
+static void rx3_install_native_pad_touch(void)
+{
+    uint32_t *entry;
+    uint32_t *trampoline;
+    void *code_page;
+    long page_size;
+
+    if (!is_rbp_process())
+        return;
+
+    entry = (uint32_t *)0x002dc104UL;
+
+    if (entry[0] != 0xe92d45f0UL ||
+        entry[1] != 0xe1a06002UL) {
+        klog_hex("keyshim: touch hook word0=", entry[0]);
+        klog_hex("keyshim: touch hook word1=", entry[1]);
+        klog_str("keyshim: native pad touch hook rejected\n");
+        return;
+    }
+
+    page_size = getpagesize();
+
+    trampoline = mmap(
+        NULL,
+        (size_t)page_size,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0
+    );
+
+    if (trampoline == MAP_FAILED) {
+        klog_str("keyshim: touch trampoline mmap failed\n");
+        return;
+    }
+
+    trampoline[0] = entry[0];
+    trampoline[1] = entry[1];
+    trampoline[2] = 0xe51ff004UL;
+    trampoline[3] = 0x002dc10cUL;
+
+    if (mprotect(
+            trampoline,
+            (size_t)page_size,
+            PROT_READ | PROT_EXEC) != 0) {
+        klog_str("keyshim: touch trampoline mprotect failed\n");
+        return;
+    }
+
+    syscall(0xf0002, trampoline, trampoline + 4, 0);
+
+    rx3_original_touch = (rx3_touch_fn)trampoline;
+
+    code_page = (void *)(
+        (uintptr_t)entry & ~((uintptr_t)page_size - 1)
+    );
+
+    if (mprotect(
+            code_page,
+            (size_t)page_size,
+            PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        klog_str("keyshim: touch code mprotect failed\n");
+        return;
+    }
+
+    entry[0] = 0xe51ff004UL;
+    entry[1] = (uint32_t)(uintptr_t)rx3_native_pad_touch;
+
+    syscall(0xf0002, entry, entry + 2, 0);
+
+    mprotect(
+        code_page,
+        (size_t)page_size,
+        PROT_READ | PROT_EXEC
+    );
+
+    klog_str("keyshim: native pad touch hook installed\n");
+}
+
 /* Set once a real control surface starts feeding /tmp/rb-ctrl.fifo: from then
  * on the synthetic mixer defaults are no longer re-applied every 10 s (they
  * would snap the physical faders/EQ back). */
@@ -311,8 +728,24 @@ static void *key_thread(void *arg)
     for (int i = 0; i < 150 && !ui_pump_running(); i++)
         ui_pump_ensure();
 
-    /* Unmute the mixer: faders default to 0 on the phone (no subucom).  Send
-     * after the pump exists so the messages are actually dispatched. */
+    /* DjEngine is created after KeyManager. Wait until it exists so the
+     * native A/B assignment cannot be lost during startup. */
+    {
+        int assigned = 0;
+
+        for (int i = 0; i < 300; i++) {
+            if (mixer_crossfader_assign()) {
+                assigned = 1;
+                break;
+            }
+            usleep(100000);
+        }
+
+        if (!assigned)
+            klog_str("keyshim: ERROR crossfader engine not ready\n");
+    }
+
+    /* Unmute the mixer after the UI pump and DjEngine are ready. */
     mixer_defaults();
     klog_str("keyshim: mixer defaults sent (ch1->deck1, ch2->deck2, faders up, "
              "trims/EQ/crossfader center)\n");
@@ -441,7 +874,12 @@ static void *ctrl_thread(void *arg)
                 klog_dec("         op=", ev.op);
                 klog_dec("         ch=", ev.ch);
                 klog_dec("         param=", ev.param);
-                send_rx_key_fl(ev.key, ev.op, ev.ch, ev.param, ev.f, ev.l);
+                if (rx3_handle_tagged_pad(&ev))
+                    continue;
+
+                send_rx_key_fl(ev.key, ev.op,
+                               ev.key == 0x6017 ? 0 : ev.ch,
+                               ev.param, ev.f, ev.l);
             }
         } else if (n < 0 && errno != EAGAIN && errno != EINTR) {
             break;
@@ -450,12 +888,166 @@ static void *ctrl_thread(void *arg)
     return NULL;
 }
 
+
+/* ---- RX3 native player-state telemetry -------------------------------
+ *
+ * Published inside the RBP process so the host DDJ-400 bridge can mirror
+ * state changed by track loading, touchscreen or any other native input.
+ */
+#define RX3_LED_MAGIC   0x524c4544UL
+#define RX3_LED_VERSION 1
+
+struct rx3_led_state_packet {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t sequence;
+
+    uint8_t hotcue[2];
+    uint8_t play_mode[2];
+    uint8_t flags[2];
+    uint8_t pad_mode[2];
+
+    uint32_t play_time[2];
+    uint32_t total_time[2];
+} __attribute__((packed));
+
+#define RX3_LED_CUE          0x01
+#define RX3_LED_LOOP         0x02
+#define RX3_LED_RELOOP       0x04
+#define RX3_LED_SYNC_MASTER  0x08
+#define RX3_LED_SYNC_SLAVE   0x10
+#define RX3_LED_MASTER_TEMPO 0x20
+
+static int rx3_native_call1(unsigned long address, int deck)
+{
+    return ((int (*)(int))address)(deck);
+}
+
+static int rx3_hotcue_bitmap(int deck)
+{
+    volatile unsigned char *root;
+    volatile unsigned char *watcher;
+    volatile unsigned char *snapshot;
+    unsigned bitmap = 0;
+
+    root = *(volatile unsigned char * volatile *)0x02685f2cUL;
+    if (!root)
+        return 0;
+
+    watcher = *(volatile unsigned char * volatile *)(root + 0x38);
+    if (!watcher)
+        return 0;
+
+    snapshot = *(volatile unsigned char * volatile *)
+        (watcher + 0x0c + deck * 4);
+    if (!snapshot)
+        return 0;
+
+    for (unsigned pad = 0; pad < 8; pad++) {
+        uint32_t intime = *(volatile uint32_t *)
+            (snapshot + 0x7c + pad * 0x34);
+
+        if (intime != 0xffffffffUL)
+            bitmap |= 1U << pad;
+    }
+
+    return (int)bitmap;
+}
+
+static void *rx3_led_state_thread(void *unused)
+{
+    struct rx3_led_state_packet packet;
+    uint16_t sequence = 0;
+    int fd = -1;
+
+    (void)unused;
+
+    klog_str("keyshim: native LED telemetry thread started\n");
+
+    /* Aguarda o StatWatcher e os snapshots dos decks. */
+    sleep(5);
+
+    for (;;) {
+        if (fd < 0) {
+            fd = real_open("/tmp/rx3-led-state.bin",
+                           O_RDWR | O_CREAT);
+            if (fd < 0) {
+                usleep(500000);
+                continue;
+            }
+
+            /* real_open uses mode zero with O_CREAT. Fix access explicitly. */
+            syscall(SYS_fchmod, fd, 0644);
+        }
+
+        memset(&packet, 0, sizeof(packet));
+
+        packet.magic = RX3_LED_MAGIC;
+        packet.version = RX3_LED_VERSION;
+        packet.sequence = ++sequence;
+
+        for (int deck = 0; deck < 2; deck++) {
+            unsigned flags = 0;
+
+            packet.hotcue[deck] =
+                (uint8_t)rx3_hotcue_bitmap(deck);
+
+            packet.play_mode[deck] =
+                (uint8_t)rx3_native_call1(0x000fd960UL, deck);
+
+            packet.pad_mode[deck] =
+                (uint8_t)rx3_native_call1(0x000fd3ccUL, deck);
+
+            if (rx3_native_call1(0x000fd53cUL, deck))
+                flags |= RX3_LED_CUE;
+
+            if (rx3_native_call1(0x000fd48cUL, deck))
+                flags |= RX3_LED_LOOP;
+
+            if (rx3_native_call1(0x000fdae8UL, deck))
+                flags |= RX3_LED_RELOOP;
+
+            if (rx3_native_call1(0x000fde30UL, deck))
+                flags |= RX3_LED_SYNC_MASTER;
+
+            if (rx3_native_call1(0x000fde60UL, deck))
+                flags |= RX3_LED_SYNC_SLAVE;
+
+            if (rx3_native_call1(0x000fd30cUL, deck))
+                flags |= RX3_LED_MASTER_TEMPO;
+
+            packet.flags[deck] = (uint8_t)flags;
+
+            packet.play_time[deck] =
+                (uint32_t)rx3_native_call1(0x000fcf7cUL, deck);
+
+            packet.total_time[deck] =
+                (uint32_t)rx3_native_call1(0x000fcfa4UL, deck);
+        }
+
+        if (lseek(fd, 0, SEEK_SET) < 0 ||
+            write(fd, &packet, sizeof(packet)) !=
+                (ssize_t)sizeof(packet)) {
+            close(fd);
+            fd = -1;
+        }
+
+        usleep(50000);
+    }
+
+    return NULL;
+}
+
 __attribute__((constructor))
 static void keyshim_init(void)
 {
     pthread_t tid;
+
+    rx3_install_native_pad_touch();
     if (pthread_create(&tid, NULL, key_thread, NULL) == 0)
         pthread_detach(tid);
     if (pthread_create(&tid, NULL, ctrl_thread, NULL) == 0)
+        pthread_detach(tid);
+    if (pthread_create(&tid, NULL, rx3_led_state_thread, NULL) == 0)
         pthread_detach(tid);
 }

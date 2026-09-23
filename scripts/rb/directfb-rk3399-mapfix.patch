@@ -1,0 +1,79 @@
+--- a/systems/fbdev/fbdev.c
++++ b/systems/fbdev/fbdev.c
+@@ -124,6 +124,20 @@
+ extern FBDev *dfb_fbdev;   /* defined further below */
+ 
+ 
++/* Return the physical framebuffer mapping size, bypassing LD_PRELOAD. */
++static size_t
++fbdev_physical_map_length( int fd, size_t fallback )
++{
++     struct fb_fix_screeninfo real;
++
++     memset( &real, 0, sizeof(real) );
++
++     if (syscall( SYS_ioctl, fd, FBIOGET_FSCREENINFO, &real ) == 0 &&
++         real.smem_len > fallback)
++          return real.smem_len;
++
++     return fallback;
++}
+ 
+ /*
+  * ROTATION (Prime GO): software-rotate the logical layer surface into the
+@@ -723,7 +737,7 @@
+              shared->fix.mmio_start, shared->fix.mmio_len >> 10 );
+ 
+      /* Map the framebuffer */
+-     dfb_fbdev->framebuffer_base = mmap( NULL, shared->fix.smem_len,
++     dfb_fbdev->framebuffer_base = mmap( NULL, fbdev_physical_map_length( dfb_fbdev->fd, shared->fix.smem_len ),
+                                          PROT_READ | PROT_WRITE, MAP_SHARED,
+                                          dfb_fbdev->fd, 0 );
+      if (dfb_fbdev->framebuffer_base == MAP_FAILED) {
+@@ -929,7 +943,8 @@
+      }
+ 
+      if (dfb_fbdev->framebuffer_base)
+-          munmap( dfb_fbdev->framebuffer_base, shared->fix.smem_len );
++          munmap( dfb_fbdev->framebuffer_base,
++                  fbdev_physical_map_length( dfb_fbdev->fd, shared->fix.smem_len ) );
+ 
+      if (dfb_fbdev->fd != -1)
+           close( dfb_fbdev->fd );
+@@ -974,7 +989,7 @@
+      }
+ 
+      /* Map the framebuffer */
+-     dfb_fbdev->framebuffer_base = mmap( NULL, dfb_fbdev->shared->fix.smem_len,
++     dfb_fbdev->framebuffer_base = mmap( NULL, fbdev_physical_map_length( dfb_fbdev->fd, dfb_fbdev->shared->fix.smem_len ),
+                                          PROT_READ | PROT_WRITE, MAP_SHARED,
+                                          dfb_fbdev->fd, 0 );
+      if (dfb_fbdev->framebuffer_base == MAP_FAILED) {
+@@ -992,7 +1007,7 @@
+      if (ret) {
+           D_ERROR( "DirectFB/FBDev: Could not join AGP!\n" );
+           munmap( dfb_fbdev->framebuffer_base,
+-             dfb_fbdev->shared->fix.smem_len );
++                  fbdev_physical_map_length( dfb_fbdev->fd, dfb_fbdev->shared->fix.smem_len ) );
+           close( dfb_fbdev->fd );
+           D_FREE( dfb_fbdev );
+           dfb_fbdev = NULL;
+@@ -1064,7 +1079,8 @@
+ 
+      dfb_surface_pool_destroy( dfb_fbdev->shared->pool );
+ 
+-     munmap( dfb_fbdev->framebuffer_base, shared->fix.smem_len );
++     munmap( dfb_fbdev->framebuffer_base,
++                  fbdev_physical_map_length( dfb_fbdev->fd, shared->fix.smem_len ) );
+ 
+      if (dfb_config->vt) {
+           ret = dfb_vt_shutdown( emergency );
+@@ -1093,7 +1109,7 @@
+      dfb_surface_pool_leave( dfb_fbdev->shared->pool );
+ 
+      munmap( dfb_fbdev->framebuffer_base,
+-             dfb_fbdev->shared->fix.smem_len );
++                  fbdev_physical_map_length( dfb_fbdev->fd, dfb_fbdev->shared->fix.smem_len ) );
+ 
+      if (dfb_config->vt) {
+           ret = dfb_vt_leave( emergency );

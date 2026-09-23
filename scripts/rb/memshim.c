@@ -33,6 +33,7 @@
 #include <stddef.h>
 #include <stdarg.h>
 #include <string.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <time.h>
@@ -186,13 +187,20 @@ ssize_t read(int fd, void *buf, size_t count)
         memset(buf, 0, 1);   /* simulate a pin that never changes */
         return 1;
     }
-    /* XDJ-RX3 touch device: report "no touch" (flag 0) at ~50 Hz so rbp's
-     * TouchPanelComm thread polls without busy-spinning. */
+    /* When the host touch bridge is active, read its native six-byte RX3
+     * reports from the FIFO. Without it, retain the old no-touch fallback. */
     if (fd >= 0 && fd < MAX_FDS && is_tsc[fd] && buf && count >= 6) {
-        struct timespec ts = { 0, 20000000 };
-        memset(buf, 0, 6);
-        nanosleep(&ts, NULL);
-        return 6;
+        const char *bridge = getenv("RX3_TOUCH_BRIDGE");
+
+        if (bridge && bridge[0] == '1')
+            return (ssize_t)syscall(SYS_read, fd, buf, count);
+
+        {
+            struct timespec ts = { 0, 20000000 };
+            memset(buf, 0, 6);
+            nanosleep(&ts, NULL);
+            return 6;
+        }
     }
     return (ssize_t)syscall(SYS_read, fd, buf, count);
 }

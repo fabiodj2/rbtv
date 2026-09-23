@@ -206,8 +206,25 @@ static float startup_gain(unsigned long long t, unsigned long long mute,
 }
 
 
+/* RX3_S24_SIGN_EXTENSION
+ * ALSA S24_LE stores a signed 24-bit sample in the low 24 bits of a
+ * 32-bit word. The RX3 leaves the upper byte clear, so negative samples
+ * must be sign-extended explicitly before mixing or level measurement.
+ */
+static int32_t s24_sign_extend(int32_t sample)
+{
+    sample &= 0x00ffffff;
+
+    if (sample & 0x00800000)
+        sample |= (int32_t)0xff000000;
+
+    return sample;
+}
+
 static int16_t s24_to_s16(int32_t sample)
 {
+    sample = s24_sign_extend(sample);
+
     if (sample > 8388607)
         sample = 8388607;
     else if (sample < -8388608)
@@ -221,6 +238,42 @@ static int16_t s24_to_s16(int32_t sample)
         sample = -32768;
 
     return (int16_t)sample;
+}
+
+/* Digital gain for DDJ-400 headphone channels 3/4.
+ * This allows a lower physical HEADPHONES LEVEL setting, reducing the
+ * analogue noise floor. RX3_HP_GAIN_X accepts integer values from 1 to 8. */
+static int headphone_gain_x(void)
+{
+    static int gain = 0;
+
+    if (!gain) {
+        const char *s = getenv("RX3_HP_GAIN_X");
+        int value = 4;
+
+        if (s && s[0] >= '1' && s[0] <= '8' && s[1] == '\0')
+            value = s[0] - '0';
+
+        gain = value;
+        alog("audioshim: headphone digital gain=%dx\n", gain);
+    }
+
+    return gain;
+}
+
+static int32_t scale_headphone_s24(int32_t sample, int gain)
+{
+    long long scaled;
+
+    sample = s24_sign_extend(sample);
+    scaled = (long long)sample * gain;
+
+    if (scaled > 8388607LL)
+        scaled = 8388607LL;
+    else if (scaled < -8388608LL)
+        scaled = -8388608LL;
+
+    return (int32_t)scaled;
 }
 
 static inline int is_real(snd_pcm_t *pcm)
@@ -507,6 +560,48 @@ int snd_pcm_link(snd_pcm_t *pcm1, snd_pcm_t *pcm2)
     return 0;
 }
 
+
+/* Master L/R VU telemetry for the host DDJ-400 bridge.
+ * Four-byte fixed record: uint16 sequence, uint8 left, uint8 right. */
+struct rx3_vu_packet {
+    uint16_t sequence;
+    uint8_t left;
+    uint8_t right;
+};
+
+static int rx3_vu_fd = -1;
+static uint16_t rx3_vu_sequence;
+static int rx3_vu_peak_left;
+static int rx3_vu_peak_right;
+static unsigned long rx3_vu_frames;
+
+static void rx3_vu_publish(void)
+{
+    struct rx3_vu_packet packet;
+
+    if (rx3_vu_fd < 0)
+        rx3_vu_fd = open("/tmp/rx3-vu.bin",
+                         O_WRONLY | O_CREAT | O_NONBLOCK, 0644);
+
+    if (rx3_vu_fd < 0)
+        return;
+
+    packet.sequence = ++rx3_vu_sequence;
+    packet.left = (uint8_t)(
+        rx3_vu_peak_left >= 32767 ? 127 : rx3_vu_peak_left >> 8
+    );
+    packet.right = (uint8_t)(
+        rx3_vu_peak_right >= 32767 ? 127 : rx3_vu_peak_right >> 8
+    );
+
+    if (lseek(rx3_vu_fd, 0, SEEK_SET) >= 0)
+        (void)write(rx3_vu_fd, &packet, sizeof(packet));
+
+    rx3_vu_peak_left = 0;
+    rx3_vu_peak_right = 0;
+    rx3_vu_frames = 0;
+}
+
 snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_uframes_t size)
 {
     init_real_alsa();
@@ -523,8 +618,8 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
     if (pcm == (snd_pcm_t *)&g_h_hp) {
         /* Headphone stream: interleave into Ch 2 (Left) and Ch 3 (Right) */
         for (snd_pcm_uframes_t i = 0; i < size; i++) {
-            int32_t l = src[i * 2 + 0];
-            int32_t r = src[i * 2 + 1];
+            int32_t l = s24_sign_extend(src[i * 2 + 0]);
+            int32_t r = s24_sign_extend(src[i * 2 + 1]);
             int32_t al = (l < 0) ? -l : l;
             int32_t ar = (r < 0) ? -r : r;
             if (al > s_peak_hp) s_peak_hp = al;
@@ -542,8 +637,8 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
 
     /* Master stream: interleave into Ch 0 (Left) and Ch 1 (Right) */
     for (snd_pcm_uframes_t i = 0; i < size; i++) {
-        int32_t l = src[i * 2 + 0];
-        int32_t r = src[i * 2 + 1];
+        int32_t l = s24_sign_extend(src[i * 2 + 0]);
+        int32_t r = s24_sign_extend(src[i * 2 + 1]);
         int32_t al = (l < 0) ? -l : l;
         int32_t ar = (r < 0) ? -r : r;
         if (al > s_peak_master) s_peak_master = al;
@@ -588,10 +683,34 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
 
     /* Convert the RX3 S24_LE samples to DDJ-400 S16_LE, preserving:
      * channels 0/1 = master and channels 2/3 = headphone cue. */
-    for (snd_pcm_uframes_t i = 0; i < size; i++) {
-        for (int c = 0; c < 4; c++)
-            g_out4ch[i * 4 + c] = s24_to_s16(g_mix4ch[i * 4 + c]);
+    {
+        int hp_gain = headphone_gain_x();
+
+        for (snd_pcm_uframes_t i = 0; i < size; i++) {
+            for (int c = 0; c < 4; c++) {
+                int32_t sample = g_mix4ch[i * 4 + c];
+
+                if (c >= 2)
+                    sample = scale_headphone_s24(sample, hp_gain);
+
+                g_out4ch[i * 4 + c] = s24_to_s16(sample);
+
+                if (c < 2) {
+                    int value = (int)g_out4ch[i * 4 + c];
+                    int magnitude = value < 0 ? -value : value;
+
+                    if (c == 0 && magnitude > rx3_vu_peak_left)
+                        rx3_vu_peak_left = magnitude;
+                    if (c == 1 && magnitude > rx3_vu_peak_right)
+                        rx3_vu_peak_right = magnitude;
+                }
+            }
+        }
     }
+
+    rx3_vu_frames += size;
+    if (rx3_vu_frames >= 882)
+        rx3_vu_publish();
 
     /* Output four interleaved channels to the DDJ-400. */
     if (g_real_playback && real_snd_pcm_writei) {

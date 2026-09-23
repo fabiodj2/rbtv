@@ -42,13 +42,13 @@
 #         USBWATCH_POLL=1         poll interval seconds
 # =============================================================================
 
-MNT=/media/usb1/sda1
-CHROOT=/home/user/rbx3-run
-CH_MNT=$CHROOT/media/usb1/sda1
-FIFO=/tmp/udev_usb1
-LOG=/home/user/usbwatch.log
-PIDFILE=/tmp/usbwatch.pid
-SEG="${USBWATCH_SEG:-/usb1/}"
+MNT="${USBWATCH_MOUNT:-/media/usb1/sda1}"
+CHROOT="${RX3_RUNTIME:-/home/orangepi/RX3-RK3399-DDJ400/work/runtime/rx3}"
+CH_MNT="$CHROOT/media/usb1/sda1"
+FIFO="$CHROOT/tmp/udev_usb1"
+LOG="${USBWATCH_LOG:-$CHROOT/tmp/usbwatch.log}"
+PIDFILE="${USBWATCH_PIDFILE:-$CHROOT/tmp/usbwatch.pid}"
+SEG="${USBWATCH_SEG:-/usb5/}"
 POLL="${USBWATCH_POLL:-1}"
 TIMEOUT=$(command -v timeout 2>/dev/null || echo "")
 
@@ -87,16 +87,49 @@ find_sticks() {
     done
 }
 
-# --- first partition, else a whole-disk filesystem --------------------------
+# --- best usable partition --------------------------------------------------
+# Some macOS-created sticks have a small EFI partition as sdX1 and the actual
+# rekordbox library as sdX2. Select the largest recognised filesystem.
 find_partition() {
     dev=$1
-    [ -b "/dev/${dev}1" ] && { echo "${dev}1"; return 0; }
-    i=0
-    while [ $i -lt 10 ]; do                 # up to 1 s, for late partition scan
-        [ -b "/dev/${dev}1" ] && { echo "${dev}1"; return 0; }
-        i=$((i + 1)); sleep 0.1
+    attempt=0
+
+    while [ "$attempt" -lt 10 ]; do
+        best=""
+        best_size=0
+
+        for node in /sys/class/block/"$dev"[0-9]*; do
+            [ -e "$node" ] || continue
+
+            part=${node##*/}
+            fstype=$(blkid -s TYPE -o value "/dev/$part" 2>/dev/null)
+            [ -n "$fstype" ] || continue
+
+            size=$(cat "$node/size" 2>/dev/null || echo 0)
+            case "$size" in
+                ''|*[!0-9]*) size=0 ;;
+            esac
+
+            if [ "$size" -gt "$best_size" ]; then
+                best="$part"
+                best_size="$size"
+            fi
+        done
+
+        if [ -n "$best" ]; then
+            echo "$best"
+            return 0
+        fi
+
+        sleep 0.1
+        attempt=$((attempt + 1))
     done
-    blkid "/dev/$dev" >/dev/null 2>&1 && { echo "$dev"; return 0; }
+
+    if blkid "/dev/$dev" >/dev/null 2>&1; then
+        echo "$dev"
+        return 0
+    fi
+
     return 1
 }
 
@@ -229,7 +262,9 @@ detach() {
     rmdir "$MNT" 2>/dev/null
 }
 
-rbp_pid() { pgrep -f '/root/pdj/rbp -a' 2>/dev/null | head -1; }
+rbp_pid() {
+    pgrep -n -f '^/lib/ld-linux\.so\.3 /root/pdj/rbp -a$' 2>/dev/null
+}
 
 # --- has rbp imported the DB? (mount-info detect flag for media kind 2 == 2) --
 # A `mount` event delivered while rbp is still starting up is dropped, so the

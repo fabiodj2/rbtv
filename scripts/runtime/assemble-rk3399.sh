@@ -11,6 +11,7 @@ PLAYER=${PLAYER:-$REPO/work/firmware-1.20/patched/rbp-rk3399}
 SHIMS=${SHIMS:-$REPO/work/build/arm32/shims}
 DISPLAY=${DISPLAY:-$REPO/work/build/arm32/display}
 PROBE=${PROBE:-$REPO/work/probe/arm32/rx3-arm32-probe}
+DFB=${DFB:-$REPO/work/rb/dfb}
 RUNTIME=${RUNTIME:-$REPO/work/runtime/rx3}
 
 # Hashes vêm de scripts/runtime/versions.env (fonte única).
@@ -101,8 +102,16 @@ $PLAYER
 $SHIMS/memshim.so
 $SHIMS/audioshim.so
 $SHIMS/keyshim.so
+$SHIMS/netshim.so
 $DISPLAY/fbshim32.so
 $PROBE
+$DFB/lib/libdirectfb-1.4.so.0.0.0
+$DFB/lib/libdirect-1.4.so.0.0.0
+$DFB/lib/libfusion-1.4.so.0.0.0
+$DFB/lib/directfb-1.4-6/systems/libdirectfb_fbdev.so
+$DFB/lib/directfb-1.4-6/wm/libdirectfbwm_default.so
+$DFB/lib/directfb-1.4-6/inputdrivers/libdirectfb_linux_input.so
+$REPO/scripts/rb/directfbrc
 "
 
 for file in $required; do
@@ -163,6 +172,10 @@ rm -f \
     "$stage/usr/lib/audioshim-ddj400.so" \
     "$stage/usr/lib/fbshim-rk3399.so"
 
+echo "== Desabilitando driver de GPU (Vivante/GAL): DirectFB deve renderizar em software"
+GAL="$stage/usr/lib/directfb-1.4-0/gfxdrivers/libdirectfb_gal.so"
+[ ! -f "$GAL" ] || mv "$GAL" "$GAL.disabled"
+
 echo "== Player e recursos oficiais"
 mkdir -p "$stage/root" "$stage/root/gui" "$stage/root/settings"
 
@@ -182,8 +195,14 @@ echo "== Shims ARM32"
 install -D -m 0755 "$SHIMS/memshim.so" "$stage/usr/lib/memshim.so"
 install -D -m 0755 "$SHIMS/audioshim.so" "$stage/usr/lib/audioshim.so"
 install -D -m 0755 "$SHIMS/keyshim.so" "$stage/usr/lib/keyshim.so"
+install -D -m 0755 "$SHIMS/netshim.so" "$stage/usr/lib/netshim.so"
 install -D -m 0755 "$DISPLAY/fbshim32.so" "$stage/usr/lib/fbshim.so"
 install -D -m 0755 "$PROBE" "$stage/usr/local/bin/rx3-arm32-probe"
+
+echo "== DirectFB customizado RK3399"
+rm -rf "$stage/usr/lib/directfb-1.4-6"
+cp -a "$DFB/lib/." "$stage/usr/lib/"
+install -D -m 0644 "$REPO/scripts/rb/directfbrc" "$stage/etc/directfbrc"
 
 echo "== Diretórios de runtime"
 mkdir -p \
@@ -213,10 +232,16 @@ do
     mkfifo -m 0666 "$stage/dev/$device"
 done
 
-for device in printkdrv0 tsc2007_2-0048
+# printkdrv0 é apenas um arquivo stub.
+: >"$stage/dev/printkdrv0"
+chmod 0666 "$stage/dev/printkdrv0"
+
+# O touch bridge escreve relatórios RX3 neste FIFO. rx3-control é usado pelo
+# helper para comandos auxiliares da interface.
+for device in tsc2007_2-0048 rx3-control
 do
-    : >"$stage/dev/$device"
-    chmod 0666 "$stage/dev/$device"
+    rm -f "$stage/dev/$device"
+    mkfifo -m 0666 "$stage/dev/$device"
 done
 
 dd if=/dev/zero bs=4096 count=1 2>/dev/null |

@@ -19,6 +19,25 @@
 static uint32_t frame[1920*1080],chrome[1920*1080];
 static uint32_t complete_frame[1280*800],candidate_frame[1280*800];
 static uint32_t *published;
+static uint32_t native_snapshot[1280*800];
+static uint32_t native_verify[1280*800];
+
+static const uint32_t *stable_native_frame(const uint32_t *source)
+{
+    const size_t bytes = 1280u * 800u * sizeof(uint32_t);
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        memcpy(native_snapshot, source, bytes);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        memcpy(native_verify, source, bytes);
+
+        if (memcmp(native_snapshot, native_verify, bytes) == 0)
+            return native_snapshot;
+    }
+
+    return native_snapshot;
+}
+
 static unsigned accepted,rejected;
 static void read_complete_frame(void){
  if(!published)return;
@@ -59,6 +78,7 @@ static void drawbutton(int i,int down){int x=(i%6)*320,y=880+(i/6)*100;box(x+4,y
 int main(int argc,char**argv){
  if(argc<2)return 2;
  int fullscreen=argc>2&&!strcmp(argv[2],"--fullscreen");
+ int native_window=argc>2&&!strcmp(argv[2],"--native-window");
  const char *fbdev=setting("RX3_FB_DEVICE","/dev/fb0");
  int src=open(argv[1],O_RDONLY),dst=-1;
  if(src<0){perror(argv[1]);return 1;}
@@ -93,18 +113,53 @@ int main(int argc,char**argv){
  long long began=ns();
  read_complete_frame();
  if(!fullscreen){
- /* Debug/bring-up preview: 1.1x upscale of the native 1280x800 image
-  * (800*11/10=880, 1280*11/10=1408) into the space left above the
-  * 200px button strip, centered ((1920-1408)/2=256). This is a rough
-  * proportional port of the original 1.25x/1600x1000 layout, not a
-  * redesign - see DISPLAY-PORT-NOTES.md. Never shown in --fullscreen. */
- memcpy(frame,chrome,sizeof(frame));
- for(int y=0;y<880;y++){int sy=y*10/11;for(int x=0;x<1408;x++)frame[y*1920+x+256]=s[sy*1280+x*10/11];}
- for(int i=0;i<12;i++)if(state->pressed&(1u<<i))drawbutton(i,1);
- for(int i=0;i<6;i++){int x=i<3?0:1664,y=(i%3)*293;float n=state->level[i];if(n<0)n=0;if(n>1)n=1;
- box(x+70,y+85,20,180,0x35434e);int h=(int)(180*n);box(x+70,y+265-h,20,h,0x199feb);box(x+30,y+257-h,100,16,0xeaf3fa);
- if(i==0||i==3){unsigned bit=i==0?1:2;box(x+8,y+43,144,32,state->headphone_cue&bit?0x126db0:0x35434e);label(x+80,y+60,"HP CUE",19,0xffffff);}
- char val[24];snprintf(val,sizeof(val),"%d%%",(int)(n*100+.5));label(x+80,y+305,val,25,0xd1dae2);}
+ if(native_window){
+  /*
+   * Teste fiel do canvas RX3: 1280x800 em escala 1:1,
+   * centralizado no scanout HDMI 1920x1080.
+   */
+  memset(frame,0,sizeof(frame));
+
+  const uint32_t *stable = stable_native_frame(s);
+
+  for(int y=0;y<800;y++)
+   memcpy(frame+(140+y)*1920+320,
+          stable+y*1280,
+          1280*4);
+ }else{
+  /* Preview diagnóstico antigo, preservado para compatibilidade. */
+  memcpy(frame,chrome,sizeof(frame));
+  for(int y=0;y<880;y++)
+   for(int x=0;x<1408;x++)
+    frame[y*1920+x+256]=s[(y*10/11)*1280+x*10/11];
+
+  for(int i=0;i<12;i++)
+   if(state->pressed&(1u<<i))
+    drawbutton(i,1);
+
+  for(int i=0;i<6;i++){
+   int x=i<3?0:1664,y=(i%3)*293;
+   float n=state->level[i];
+   if(n<0)n=0;
+   if(n>1)n=1;
+
+   box(x+70,y+85,20,180,0x35434e);
+   int h=(int)(180*n);
+   box(x+70,y+265-h,20,h,0x199feb);
+   box(x+30,y+257-h,100,16,0xeaf3fa);
+
+   if(i==0||i==3){
+    unsigned bit=i==0?1:2;
+    box(x+8,y+43,144,32,
+        state->headphone_cue&bit?0x126db0:0x35434e);
+    label(x+80,y+60,"HP CUE",19,0xffffff);
+   }
+
+   char val[24];
+   snprintf(val,sizeof(val),"%d%%",(int)(n*100+.5));
+   label(x+80,y+305,val,25,0xd1dae2);
+  }
+ }
  }
  if(kms){d=scanout[back].map;f.line_length=scanout[back].pitch;}
  if(fullscreen)rx3_fullscreen_present(d,f.line_length,s,frame);

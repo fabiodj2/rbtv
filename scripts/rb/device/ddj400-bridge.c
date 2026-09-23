@@ -34,7 +34,7 @@
  *     -s  sniff mode: log every MIDI message with its decoded name and send
  *         nothing (use this to verify/repair a mapping against new hardware)
  *     -l  list the mapping table and exit
- *     -J  jog pulses per revolution (default 1800)
+ *     -J  jog pulses per revolution (default 720)
  *     -F  at startup, select FILTER as the Sound Color FX type on both chans
  */
 #define _GNU_SOURCE
@@ -65,13 +65,16 @@
 #define K_LOAD        0x4311   /* + deck channel */
 #define K_PLAY        0x4101
 #define K_CUE         0x4102
+#define K_VINYL      0x4104
 #define K_SYNC        0x4112
 #define K_JOG_TOUCH   0x4306
 #define K_JOG_ROT     0x4305
 #define K_TEMPO_RANGE 0x4107
+#define K_MASTER_TEMPO 0x4108
 #define K_TEMPO_SLIDER 0x4109
 #define K_ALOOP       0x4114
 #define K_HOTCUE      0x4113
+#define K_CUEDELETE   0x4124
 #define K_SLIPLOOP    0x4115
 #define K_BEATJUMP    0x4116
 #define K_PAD1        0x4117   /* .. K_PAD1+7 */
@@ -97,6 +100,8 @@
 #define K_BEATPREV    0x4490
 #define K_BEATNEXT    0x4491
 #define K_TAP         0x4492
+#define K_CALLNEXT    0x4322
+#define K_CALLPREV    0x4323
 
 #define CH_GLOBAL     1
 
@@ -116,7 +121,7 @@ static int   opt_sniff   = 0;
 static int   opt_filter_init = 0;
 static const char *fifo_path = "/tmp/rb-ctrl.fifo";
 static const char *midi_dev  = NULL;
-static float jog_ppr = 1800.0f;    /* DDJ-400 jog pulses per revolution */
+static float jog_ppr = 720.0f;    /* DDJ-400 jog pulses per revolution */
 static int   jog_idle_ms = 60;     /* emit speed 0 after this idle time  */
 
 static int fifo_fd = -1;
@@ -282,6 +287,8 @@ static void build_cc14(void)
     add_cc14(MC_MIXER, 0x1F, K_XFADER,  OP_ROTATE, CH_GLOBAL, 0);
     add_cc14(MC_MIXER, 0x0C, K_HPMIX,   OP_ROTATE, CH_GLOBAL, 0);
     add_cc14(MC_MIXER, 0x0D, K_HPLEVEL, OP_ROTATE, CH_GLOBAL, 0);
+    /* LEVEL/DEPTH: CC14 0x02/0x22, resolução 0..16383. */
+    add_cc14(MC_FX, 0x02, K_DEPTH, OP_VALUE, CH_GLOBAL, 0);
 }
 
 /* ---------------- jog wheels ---------------- */
@@ -345,39 +352,139 @@ static void jog_tick(void)
 }
 
 /* ---------------- pads ---------------- */
-/* note = mode*16 + (pad-1);  modes: 0 hot cue, 1 beat loop, 2 beat jump,
- * 3 sampler, 4 keyboard, 5 pad fx1, 6 pad fx2, 7 key shift.
- * The RX3 engine has 4 pad banks: HOT CUE / AUTO LOOP / SLIP LOOP / BEAT JUMP. */
+/*
+ * Formato real confirmado na DDJ-400:
+ *
+ *   0x00..0x07 = HOT CUE
+ *   0x10..0x17 = PAD FX 1
+ *   0x20..0x27 = BEAT JUMP
+ *   0x30..0x37 = SAMPLER
+ *   0x40..0x47 = KEYBOARD
+ *   0x50..0x57 = PAD FX 2
+ *   0x60..0x67 = BEAT LOOP
+ *   0x70..0x77 = KEY SHIFT
+ *
+ * O engine RX3 possui quatro bancos nativos. Os modos sem equivalente
+ * exato são encaminhados ao banco nativo mais próximo.
+ */
 static int pad_bank[2] = { -1, -1 };
 
-static void pad_select_bank(int deck, int mode)
+static int pad_rx3_bank(int ddj_mode)
 {
-    int key;
-    switch (mode) {
-    case 0: key = K_HOTCUE;   break;
-    case 1: key = K_ALOOP;    break;
-    case 2: key = K_BEATJUMP; break;
-    case 3: key = K_SLIPLOOP; break;   /* no sampler in this engine */
-    default: return;
+    switch (ddj_mode) {
+    case 0: return 0; /* HOT CUE  -> HOT CUE */
+    case 1: return 2; /* PAD FX 1 -> SLIP LOOP */
+    case 2: return 3; /* BEAT JUMP */
+    case 3: return 1; /* SAMPLER  -> BEAT LOOP */
+    case 4: return 0; /* KEYBOARD -> HOT CUE */
+    case 5: return 2; /* PAD FX 2 -> SLIP LOOP */
+    case 6: return 2; /* SHIFT+SAMPLER -> SLIP LOOP */
+    case 7: return 3; /* KEY SHIFT -> BEAT JUMP */
+    default:
+        return -1;
     }
-    if (pad_bank[deck] == mode)
-        return;
-    pad_bank[deck] = mode;
-    send_tap(key, deck + 1);
 }
 
-static void handle_pad(int deck, int note, int on)
+static const char *pad_mode_name(int mode)
 {
-    int mode = (note >> 4) & 0x0F;
-    int idx  = note & 0x0F;
-    if (opt_verbose)
-        logmsg("  pad deck%d note 0x%02x (mode %d pad %d) %s%s\n",
-               deck + 1, note, mode, idx + 1, on ? "press" : "release",
-               mode > 3 ? "  [no RX3 bank: ignored]" : "");
-    if (idx > 7 || mode > 3)
+    static const char *names[8] = {
+        "HOT CUE",
+        "PAD FX 1",
+        "BEAT JUMP",
+        "SAMPLER",
+        "KEYBOARD",
+        "PAD FX 2",
+        "BEAT LOOP",
+        "KEY SHIFT"
+    };
+
+    if (mode < 0 || mode > 7)
+        return "UNKNOWN";
+
+    return names[mode];
+}
+
+static void pad_select_bank(int deck, int ddj_mode)
+{
+    int rx3_bank = pad_rx3_bank(ddj_mode);
+    int key;
+
+    switch (rx3_bank) {
+    case 0: key = K_HOTCUE;   break;
+    case 1: key = K_ALOOP;    break;
+    case 2: key = K_SLIPLOOP; break;
+    case 3: key = K_BEATJUMP; break;
+    default:
         return;
+    }
+
+    if (pad_bank[deck] == rx3_bank)
+        return;
+
+    pad_bank[deck] = rx3_bank;
+
+    /*
+     * A seleção real do banco é feita pelo keyshim, que consulta o
+     * estado nativo e aguarda a confirmação da troca.
+     */
+
+    if (opt_verbose)
+        logmsg("  pad bank deck%d: DDJ %s (%d) -> RX3 bank %d key=0x%04x\n",
+               deck + 1, pad_mode_name(ddj_mode), ddj_mode,
+               rx3_bank, key);
+}
+
+static void handle_pad(int deck, int note, int on, int shifted)
+{
+    int mode = (note >> 4) & 0x0f;
+    int idx = note & 0x0f;
+
+    if (opt_verbose)
+        logmsg("  pad deck%d note 0x%02x (%s mode=%d pad=%d) %s\n",
+               deck + 1, note, pad_mode_name(mode), mode, idx + 1,
+               on ? "press" : "release");
+
+    if (idx > 7 || mode > 7)
+        return;
+
     pad_select_bank(deck, mode);
-    send_ctrl(K_PAD1 + idx, on ? OP_PRESS : OP_RELEASE, deck + 1, 0, 0.0f, 0);
+
+    /*
+     * A DDJ-400 envia SHIFT+PAD pelo canal MIDI alternativo.
+     * No banco Hot Cue, reproduzir a operação nativa:
+     *
+     *   press:   CueDelete press -> Pad press
+     *   release: Pad release -> CueDelete release
+     */
+    if (shifted && mode == 0) {
+        if (on) {
+            send_ctrl(K_CUEDELETE, OP_PRESS,
+                      deck + 1, 0, 0.0f, 0);
+            send_ctrl(K_PAD1 + idx, OP_PRESS,
+                      deck + 1, 0, 0.0f, 0);
+        } else {
+            send_ctrl(K_PAD1 + idx, OP_RELEASE,
+                      deck + 1, 0, 0.0f, 0);
+            send_ctrl(K_CUEDELETE, OP_RELEASE,
+                      deck + 1, 0, 0.0f, 0);
+        }
+
+        if (opt_verbose)
+            logmsg("  HOT CUE DELETE deck%d pad%d %s\n",
+                   deck + 1, idx + 1,
+                   on ? "press" : "release");
+        return;
+    }
+
+    {
+        int rx3_bank = pad_rx3_bank(mode);
+
+        if (rx3_bank >= 0)
+            send_ctrl(K_PAD1 + idx,
+                      on ? OP_PRESS : OP_RELEASE,
+                      deck + 1, 0, 0.0f,
+                      0x5040 | rx3_bank);
+    }
 }
 
 /* ---------------- note mapping table ---------------- */
@@ -389,6 +496,12 @@ struct notemap {
     const char *name;
 };
 static const struct notemap notemap[] = {
+    /* DDJ400_REAL_LOAD_NOTES
+     * The hardware emits LOAD as note 0x3f on each deck's MIDI channel.
+     * Keep the older mixer-channel mappings below for compatibility. */
+    { MC_DECK1, 0x3f, K_LOAD, 1, "LOAD deck 1" },
+    { MC_DECK2, 0x3f, K_LOAD, 2, "LOAD deck 2" },
+
     /* BROWSER (ch 7) */
     { MC_MIXER, 0x41, K_SELECTOR, CH_GLOBAL, "BROWSE push (select/enter)" },
     { MC_MIXER, 0x42, K_BACK,     CH_GLOBAL, "SHIFT+BROWSE push (back)" },
@@ -401,10 +514,12 @@ static const struct notemap notemap[] = {
     { MC_DECK2, 0x0B, K_PLAY, 0, "PLAY/PAUSE" },
     { MC_DECK1, 0x47, K_REV,  0, "SHIFT+PLAY (censor)" },
     { MC_DECK2, 0x47, K_REV,  0, "SHIFT+PLAY (censor)" },
+    { MC_DECK1, 0x48, K_VINYL, 0, "SHIFT+CUE -> VINYL" },
     { MC_DECK1, 0x0C, K_CUE,  0, "CUE" },
+    { MC_DECK2, 0x48, K_VINYL, 0, "SHIFT+CUE -> VINYL" },
     { MC_DECK2, 0x0C, K_CUE,  0, "CUE" },
-    { MC_DECK1, 0x58, K_SYNC, 0, "BEAT SYNC" },
-    { MC_DECK2, 0x58, K_SYNC, 0, "BEAT SYNC" },
+    { MC_DECK1, 0x58, K_MASTER_TEMPO, 0, "BEAT SYNC -> MASTER TEMPO" },
+    { MC_DECK2, 0x58, K_MASTER_TEMPO, 0, "BEAT SYNC -> MASTER TEMPO" },
     { MC_DECK1, 0x5C, K_MASTER, 0, "BEAT SYNC long (master)" },
     { MC_DECK2, 0x5C, K_MASTER, 0, "BEAT SYNC long (master)" },
     { MC_DECK1, 0x60, K_TEMPO_RANGE, 0, "SHIFT+SYNC (tempo range)" },
@@ -415,6 +530,10 @@ static const struct notemap notemap[] = {
     { MC_DECK2, 0x11, K_LOOPOUT, 0, "LOOP OUT" },
     { MC_DECK1, 0x4D, K_RELOOP,  0, "RELOOP/EXIT" },
     { MC_DECK2, 0x4D, K_RELOOP,  0, "RELOOP/EXIT" },
+    { MC_DECK1, 0x51, K_CALLPREV, 0, "CUE/LOOP CALL 1/2X" },
+    { MC_DECK1, 0x53, K_CALLNEXT, 0, "CUE/LOOP CALL 2X" },
+    { MC_DECK2, 0x51, K_CALLPREV, 0, "CUE/LOOP CALL 1/2X" },
+    { MC_DECK2, 0x53, K_CALLNEXT, 0, "CUE/LOOP CALL 2X" },
     /* jog plate touch */
     { MC_DECK1, 0x36, K_JOG_TOUCH, 0, "jog plate touch" },
     { MC_DECK2, 0x36, K_JOG_TOUCH, 0, "jog plate touch" },
@@ -427,28 +546,93 @@ static const struct notemap notemap[] = {
     { MC_DECK2, 0x1E, K_ALOOP,    0, "PAD MODE beat loop" },
     { MC_DECK1, 0x20, K_BEATJUMP, 0, "PAD MODE beat jump" },
     { MC_DECK2, 0x20, K_BEATJUMP, 0, "PAD MODE beat jump" },
-    { MC_DECK1, 0x22, K_SLIPLOOP, 0, "PAD MODE sampler" },
-    { MC_DECK2, 0x22, K_SLIPLOOP, 0, "PAD MODE sampler" },
-    /* BEAT FX (ch 5) */
-    { MC_FX, 0x4A, K_BFXTYPE,  CH_GLOBAL, "BEAT FX select" },
-    { MC_FX, 0x4B, K_BFX,      CH_GLOBAL, "BEAT FX on/off" },
-    { MC_FX, 0x47, K_TAP,      CH_GLOBAL, "BEAT FX tap" },
-    { MC_FX, 0x63, K_BEATPREV, CH_GLOBAL, "BEAT FX beat <" },
-    { MC_FX, 0x64, K_BEATNEXT, CH_GLOBAL, "BEAT FX beat >" },
+    { MC_DECK1, 0x22, K_ALOOP, 0, "PAD MODE sampler -> beat loop" },
+    { MC_DECK2, 0x22, K_ALOOP, 0, "PAD MODE sampler -> beat loop" },
+    /* BEAT FX (canal MIDI 5; verificado por captura física) */
+    { MC_FX, 0x63, K_BFXTYPE,  CH_GLOBAL, "BEAT FX select" },
+    { MC_FX, 0x4A, K_BEATPREV, CH_GLOBAL, "BEAT FX beat <" },
+    { MC_FX, 0x4B, K_BEATNEXT, CH_GLOBAL, "BEAT FX beat >" },
+    { MC_FX, 0x47, K_BFX,      CH_GLOBAL, "BEAT FX on/off" },
 };
 #define NNMAP ((int)(sizeof(notemap) / sizeof(notemap[0])))
 
 /* BEAT FX channel-select switch: notes 16/17/20 on ch 5 -> ch 1 / 2 / MASTER */
-static int handle_fxch(int note)
+
+#define BFX_TYPE_COUNT 14
+
+/* O botão SELECT da DDJ-400 é momentâneo, enquanto o RX3 espera
+ * o índice absoluto do efeito via OP_VALUE. O estado começa em DELAY=0. */
+static int beat_fx_type = 0;
+
+static int handle_beat_fx_select(int note, int on)
 {
-    int v;
-    if (note == 0x10)      v = 1;
-    else if (note == 0x11) v = 2;
-    else if (note == 0x14) v = 5;
-    else return 0;
+    if (note != 0x63)
+        return 0;
+
+    /* Consumir também a nota OFF, sem avançar novamente. */
+    if (!on)
+        return 1;
+
+    beat_fx_type++;
+    if (beat_fx_type >= BFX_TYPE_COUNT)
+        beat_fx_type = 0;
+
     if (opt_verbose)
-        logmsg("  beat fx channel select -> %d\n", v);
-    send_ctrl(K_BFXCH, OP_VALUE, CH_GLOBAL, v, 0.0f, 0);
+        logmsg("  beat fx type select -> %d\n", beat_fx_type);
+
+    send_ctrl(
+        K_BFXTYPE,
+        OP_VALUE,
+        CH_GLOBAL,
+        beat_fx_type,
+        (float)beat_fx_type,
+        beat_fx_type
+    );
+
+    return 1;
+}
+
+static int handle_fxch(int note, int on)
+{
+    int value;
+
+    /* Índices nativos do RX3:
+     *   0 = deck 1
+     *   1 = deck 2
+     *   5 = master
+     *
+     * A chave da DDJ envia também notas OFF das posições anteriores.
+     * Elas devem ser consumidas, mas não enviadas ao player.
+     */
+    switch (note) {
+    case 0x10:
+        value = 0;
+        break;
+    case 0x11:
+        value = 1;
+        break;
+    case 0x14:
+        value = 5;
+        break;
+    default:
+        return 0;
+    }
+
+    if (!on)
+        return 1;
+
+    if (opt_verbose)
+        logmsg("  beat fx channel select -> %d\n", value);
+
+    send_ctrl(
+        K_BFXCH,
+        OP_VALUE,
+        CH_GLOBAL,
+        value,
+        (float)value,
+        value
+    );
+
     return 1;
 }
 
@@ -470,10 +654,18 @@ static void handle_note(int ch, int note, int on)
                ch + 1, note, note, on ? "on" : "off", note_name(ch, note));
         return;
     }
-    if (ch == MC_FX && handle_fxch(note))
+    if (ch == MC_FX && handle_beat_fx_select(note, on))
         return;
-    if (ch == MC_PAD1 || ch == MC_PAD1_SH) { handle_pad(0, note, on); return; }
-    if (ch == MC_PAD2 || ch == MC_PAD2_SH) { handle_pad(1, note, on); return; }
+    if (ch == MC_FX && handle_fxch(note, on))
+        return;
+    if (ch == MC_PAD1 || ch == MC_PAD1_SH) {
+        handle_pad(0, note, on, ch == MC_PAD1_SH);
+        return;
+    }
+    if (ch == MC_PAD2 || ch == MC_PAD2_SH) {
+        handle_pad(1, note, on, ch == MC_PAD2_SH);
+        return;
+    }
 
     for (int i = 0; i < NNMAP; i++) {
         int sch;
@@ -515,7 +707,9 @@ static void handle_cc(int ch, int cc, int val)
      * 0x29 SHIFT+platter (search).  All relative. */
     if ((ch == MC_DECK1 || ch == MC_DECK2) &&
         (cc == 0x21 || cc == 0x22 || cc == 0x23 || cc == 0x29)) {
-        jog_delta(ch, (val >= 64) ? val - 128 : val);
+        /* Pioneer jog CC is offset-binary around 0x40:
+         * 0x3f=-1, 0x40=0, 0x41=+1. It is not two's complement. */
+        jog_delta(ch, val - 64);
         return;
     }
 
@@ -539,6 +733,556 @@ static void handle_cc(int ch, int cc, int val)
 
     if (opt_verbose)
         logmsg("  unmapped ch%d cc 0x%02x val=%d\n", ch, cc, val);
+}
+
+
+/* ---------------- DDJ-400 Master VU output ---------------- */
+struct rx3_vu_packet {
+    uint16_t sequence;
+    uint8_t left;
+    uint8_t right;
+};
+
+static char vu_path[512];
+static int vu_fd = -1;
+static uint16_t vu_last_sequence;
+static int vu_left;
+static int vu_right;
+static int vu_idle_ticks;
+
+static void vu_init_path(void)
+{
+    const char *slash = strrchr(fifo_path, '/');
+
+    if (slash) {
+        size_t length = (size_t)(slash - fifo_path);
+
+        if (length > sizeof(vu_path) - 13)
+            length = sizeof(vu_path) - 13;
+
+        memcpy(vu_path, fifo_path, length);
+        vu_path[length] = '\0';
+        strcat(vu_path, "/rx3-vu.bin");
+    } else {
+        snprintf(vu_path, sizeof(vu_path), "rx3-vu.bin");
+    }
+
+    if (opt_verbose)
+        logmsg("ddj400: VU telemetry %s\n", vu_path);
+}
+
+static void midi_write3(int fd, int status, int data1, int data2)
+{
+    unsigned char message[3];
+
+    message[0] = (unsigned char)status;
+    message[1] = (unsigned char)data1;
+    message[2] = (unsigned char)data2;
+
+    if (write(fd, message, sizeof(message)) < 0 &&
+        errno != EAGAIN && errno != EINTR && opt_verbose)
+        logmsg("ddj400: MIDI output failed: %s\n", strerror(errno));
+}
+
+static void vu_midi_init(int midi_fd)
+{
+    /* Use both physical meters as stereo Master L/R. */
+    midi_write3(midi_fd, 0x9f, 0x4b, 0x7f);
+    midi_write3(midi_fd, 0xb0, 0x02, 0);
+    midi_write3(midi_fd, 0xb1, 0x02, 0);
+
+    vu_left = 0;
+    vu_right = 0;
+    vu_idle_ticks = 0;
+    vu_last_sequence = 0;
+}
+
+static int vu_decay(int current, int target)
+{
+    if (target >= current)
+        return target;
+
+    current -= 5;
+    if (current < target)
+        current = target;
+    if (current < 0)
+        current = 0;
+
+    return current;
+}
+
+static void vu_tick(int midi_fd)
+{
+    struct rx3_vu_packet packet;
+    int target_left = 0;
+    int target_right = 0;
+    int previous_left = vu_left;
+    int previous_right = vu_right;
+
+    if (vu_fd < 0)
+        vu_fd = open(vu_path, O_RDONLY | O_NONBLOCK);
+
+    if (vu_fd >= 0) {
+        ssize_t count = pread(vu_fd, &packet, sizeof(packet), 0);
+
+        if (count == (ssize_t)sizeof(packet) &&
+            packet.sequence != vu_last_sequence) {
+            vu_last_sequence = packet.sequence;
+            target_left = packet.left;
+            target_right = packet.right;
+            vu_idle_ticks = 0;
+        } else {
+            vu_idle_ticks++;
+            if (vu_idle_ticks < 25) {
+                target_left = vu_left;
+                target_right = vu_right;
+            }
+        }
+    }
+
+    vu_left = vu_decay(vu_left, target_left);
+    vu_right = vu_decay(vu_right, target_right);
+
+    if (vu_left != previous_left)
+        midi_write3(midi_fd, 0xb0, 0x02, vu_left);
+    if (vu_right != previous_right)
+        midi_write3(midi_fd, 0xb1, 0x02, vu_right);
+}
+
+
+/* ---------------- DDJ-400 LED feedback ---------------- */
+static unsigned char led_play[2];
+static unsigned char led_sync[2];
+static unsigned char led_master[2];
+static unsigned char led_channel_cue[2];
+static unsigned char led_loop_in[2];
+static unsigned char led_loop_out[2];
+static unsigned char led_reloop[2];
+static unsigned char led_master_cue;
+static unsigned char led_beat_fx;
+
+/* Estado local dos pads até termos telemetria nativa do player. */
+static signed char led_beat_loop_pad[2] = { -1, -1 };
+static long long led_beat_jump_deadline[2][8];
+
+static void led_send(int fd, int channel, int note, int enabled)
+{
+    midi_write3(fd, 0x90 | channel, note, enabled ? 0x7f : 0x00);
+}
+
+
+/* Estado nativo publicado pelo keyshim dentro do processo RBP. */
+#define RX3_LED_MAGIC   0x524c4544UL
+#define RX3_LED_VERSION 1
+
+struct rx3_led_state_packet {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t sequence;
+
+    uint8_t hotcue[2];
+    uint8_t play_mode[2];
+    uint8_t flags[2];
+    uint8_t pad_mode[2];
+
+    uint32_t play_time[2];
+    uint32_t total_time[2];
+} __attribute__((packed));
+
+static char native_led_state_path[512];
+static int native_led_state_fd = -1;
+static uint16_t native_led_last_sequence;
+static unsigned char native_led_hotcue[2] = { 0xff, 0xff };
+static int native_led_force_sync = 1;
+
+static void native_led_state_init_path(void)
+{
+    const char *slash = strrchr(fifo_path, '/');
+
+    if (slash) {
+        size_t length = (size_t)(slash - fifo_path);
+
+        if (length > sizeof(native_led_state_path) - 24)
+            length = sizeof(native_led_state_path) - 24;
+
+        memcpy(native_led_state_path, fifo_path, length);
+        native_led_state_path[length] = '\0';
+        strcat(native_led_state_path, "/rx3-led-state.bin");
+    } else {
+        snprintf(native_led_state_path,
+                 sizeof(native_led_state_path),
+                 "rx3-led-state.bin");
+    }
+
+    if (opt_verbose)
+        logmsg("ddj400: native LED telemetry %s\n",
+               native_led_state_path);
+}
+
+static void native_led_state_reset(void)
+{
+    native_led_last_sequence = 0;
+    native_led_hotcue[0] = 0xff;
+    native_led_hotcue[1] = 0xff;
+    native_led_force_sync = 1;
+}
+
+static void native_led_send_hotcues(int midi_fd, int deck,
+                                    unsigned char bitmap)
+{
+    int normal_channel =
+        deck == 0 ? MC_PAD1 : MC_PAD2;
+    int shifted_channel =
+        deck == 0 ? MC_PAD1_SH : MC_PAD2_SH;
+
+    /*
+     * A DDJ-400 mantém páginas separadas de LED para o estado normal
+     * e para SHIFT. O mapeamento oficial envia cada Hot Cue para ambas.
+     */
+    for (int pad = 0; pad < 8; pad++) {
+        int enabled = (bitmap & (1U << pad)) != 0;
+
+        led_send(midi_fd, normal_channel, pad, enabled);
+        led_send(midi_fd, shifted_channel, pad, enabled);
+    }
+}
+
+static void native_led_state_tick(int midi_fd)
+{
+    struct rx3_led_state_packet packet;
+
+    if (native_led_state_fd < 0) {
+        native_led_state_fd =
+            open(native_led_state_path, O_RDONLY | O_NONBLOCK);
+
+        if (native_led_state_fd < 0)
+            return;
+    }
+
+    ssize_t count = pread(native_led_state_fd,
+                          &packet, sizeof(packet), 0);
+
+    if (count != (ssize_t)sizeof(packet))
+        return;
+
+    if (packet.magic != RX3_LED_MAGIC ||
+        packet.version != RX3_LED_VERSION)
+        return;
+
+    if (!native_led_force_sync &&
+        packet.sequence == native_led_last_sequence)
+        return;
+
+    native_led_last_sequence = packet.sequence;
+
+    for (int deck = 0; deck < 2; deck++) {
+        if (native_led_force_sync ||
+            packet.hotcue[deck] != native_led_hotcue[deck]) {
+            native_led_hotcue[deck] = packet.hotcue[deck];
+
+            native_led_send_hotcues(
+                midi_fd, deck, packet.hotcue[deck]);
+
+            if (opt_verbose)
+                logmsg("ddj400: native hotcue deck%d bitmap=0x%02x\n",
+                       deck + 1, packet.hotcue[deck]);
+        }
+    }
+
+    native_led_force_sync = 0;
+}
+
+/* Apaga Beat Jump um segundo depois sem bloquear o loop MIDI. */
+static void pad_led_tick(int fd)
+{
+    long long current = now_ms();
+
+    for (int deck = 0; deck < 2; deck++) {
+        int channel = deck == 0 ? MC_PAD1 : MC_PAD2;
+
+        for (int idx = 0; idx < 8; idx++) {
+            long long deadline = led_beat_jump_deadline[deck][idx];
+
+            if (deadline > 0 && current >= deadline) {
+                led_beat_jump_deadline[deck][idx] = 0;
+                led_send(fd, channel, 0x20 + idx, 0);
+            }
+        }
+    }
+}
+
+static void led_clear_deck(int fd, int deck)
+{
+    int channel = deck;
+
+    led_play[deck] = 0;
+    led_sync[deck] = 0;
+    led_master[deck] = 0;
+    led_loop_in[deck] = 0;
+    led_loop_out[deck] = 0;
+    led_reloop[deck] = 0;
+
+    led_send(fd, channel, 0x0b, 0);
+    led_send(fd, channel, 0x0c, 0);
+    led_send(fd, channel, 0x58, 0);
+    led_send(fd, channel, 0x5c, 0);
+    led_send(fd, channel, 0x10, 0);
+    led_send(fd, channel, 0x11, 0);
+    led_send(fd, channel, 0x4d, 0);
+}
+
+static void led_loaded(int fd, int deck)
+{
+    led_clear_deck(fd, deck);
+    midi_write3(fd, 0x9f, deck, 0x7f);
+}
+
+static void led_midi_init(int fd)
+{
+    memset(led_play, 0, sizeof(led_play));
+    memset(led_sync, 0, sizeof(led_sync));
+    memset(led_master, 0, sizeof(led_master));
+    memset(led_channel_cue, 0, sizeof(led_channel_cue));
+    memset(led_loop_in, 0, sizeof(led_loop_in));
+    memset(led_loop_out, 0, sizeof(led_loop_out));
+    memset(led_reloop, 0, sizeof(led_reloop));
+
+    led_master_cue = 0;
+    led_beat_fx = 0;
+
+    for (int deck = 0; deck < 2; deck++) {
+        int pad_channel = deck == 0 ? MC_PAD1 : MC_PAD2;
+
+        led_beat_loop_pad[deck] = -1;
+        memset(led_beat_jump_deadline[deck], 0,
+               sizeof(led_beat_jump_deadline[deck]));
+
+        for (int mode = 0; mode < 8; mode++)
+            for (int idx = 0; idx < 8; idx++)
+                led_send(fd, pad_channel, mode * 16 + idx, 0);
+    }
+
+    led_clear_deck(fd, 0);
+    led_clear_deck(fd, 1);
+
+    midi_write3(fd, 0x9f, 0x00, 0);
+    midi_write3(fd, 0x9f, 0x01, 0);
+
+    led_send(fd, 0, 0x54, 0);
+    led_send(fd, 1, 0x54, 0);
+    led_send(fd, 6, 0x63, 0);
+    led_send(fd, 4, 0x47, 0);
+}
+
+static void led_handle_input(int fd, int channel, int note, int on)
+{
+    int deck;
+
+    /*
+     * Feedback dos performance pads.
+     *
+     * HOT CUE:
+     *   permanece aceso; SHIFT+PAD apaga.
+     *
+     * BEAT LOOP:
+     *   permanece aceso enquanto o loop local estiver ativo.
+     *
+     * BEAT JUMP:
+     *   permanece aceso por um segundo após o acionamento.
+     *
+     * Outros modos:
+     *   indicação momentânea.
+     */
+    if (channel == MC_PAD1 || channel == MC_PAD1_SH ||
+        channel == MC_PAD2 || channel == MC_PAD2_SH) {
+        int shifted = channel == MC_PAD1_SH || channel == MC_PAD2_SH;
+        int normal_channel =
+            (channel == MC_PAD1 || channel == MC_PAD1_SH)
+                ? MC_PAD1 : MC_PAD2;
+        int pad_deck =
+            (channel == MC_PAD1 || channel == MC_PAD1_SH) ? 0 : 1;
+        int mode = (note >> 4) & 0x0f;
+        int idx = note & 0x0f;
+
+        if (idx > 7 || mode > 7)
+            return;
+
+        /* SHIFT+PAD em Hot Cue: apagar o LED persistente. */
+        if (shifted && mode == 0) {
+            if (on)
+                led_send(fd, normal_channel, idx, 0);
+            return;
+        }
+
+        /* Hot Cue permanece aceso. */
+        if (!shifted && mode == 0) {
+            if (on)
+                led_send(fd, normal_channel, idx, 1);
+            return;
+        }
+
+        /* Beat Jump acende durante um segundo. */
+        if (!shifted && mode == 2) {
+            if (on) {
+                led_send(fd, normal_channel, note, 1);
+                led_beat_jump_deadline[pad_deck][idx] =
+                    now_ms() + 1000;
+            }
+            return;
+        }
+
+        /* Beat Loop: um pad fica travado por deck. */
+        if (!shifted && mode == 6) {
+            if (on) {
+                int previous = led_beat_loop_pad[pad_deck];
+
+                if (previous == idx) {
+                    led_send(fd, normal_channel, 0x60 + idx, 0);
+                    led_beat_loop_pad[pad_deck] = -1;
+                } else {
+                    if (previous >= 0)
+                        led_send(fd, normal_channel,
+                                 0x60 + previous, 0);
+
+                    led_send(fd, normal_channel, 0x60 + idx, 1);
+                    led_beat_loop_pad[pad_deck] = idx;
+                }
+            }
+            return;
+        }
+
+        led_send(fd, channel, note, on);
+        return;
+    }
+
+    /* LOAD enviado pelos canais de deck. */
+    if ((channel == 0 || channel == 1) && note == 0x3f) {
+        if (on)
+            led_loaded(fd, channel);
+        return;
+    }
+
+    /* LOAD alternativo enviado pelo canal do browser. */
+    if (channel == 6 && (note == 0x46 || note == 0x47)) {
+        if (on)
+            led_loaded(fd, note == 0x46 ? 0 : 1);
+        return;
+    }
+
+    if (channel == 0 || channel == 1) {
+        deck = channel;
+
+        switch (note) {
+        case 0x0b: /* PLAY/PAUSE */
+            if (on) {
+                led_play[deck] ^= 1;
+                led_send(fd, deck, note, led_play[deck]);
+            }
+            return;
+
+        case 0x0c: /* CUE */
+            if (on) {
+                led_play[deck] = 0;
+                led_send(fd, deck, 0x0b, 0);
+            }
+            led_send(fd, deck, note, on);
+            return;
+
+        case 0x58: /* BEAT SYNC */
+            if (on) {
+                led_sync[deck] ^= 1;
+                led_send(fd, deck, note, led_sync[deck]);
+            }
+            return;
+
+        case 0x5c: /* MASTER */
+            if (on) {
+                int other = deck ^ 1;
+                led_master[deck] ^= 1;
+
+                if (led_master[deck]) {
+                    led_master[other] = 0;
+                    led_send(fd, other, 0x5c, 0);
+                }
+
+                led_send(fd, deck, note, led_master[deck]);
+            }
+            return;
+
+        case 0x47: /* CENSOR/REVERSE */
+        case 0x51: /* CUE/LOOP CALL 1/2X */
+        case 0x53: /* CUE/LOOP CALL 2X */
+            led_send(fd, deck, note, on);
+            return;
+
+        case 0x10: /* LOOP IN */
+            if (on) {
+                led_loop_in[deck] = 1;
+                led_loop_out[deck] = 0;
+                led_reloop[deck] = 0;
+
+                led_send(fd, deck, 0x10, 1);
+                led_send(fd, deck, 0x11, 0);
+                led_send(fd, deck, 0x4d, 0);
+            }
+            return;
+
+        case 0x11: /* LOOP OUT */
+            if (on) {
+                led_loop_out[deck] = 1;
+                led_reloop[deck] = 1;
+
+                led_send(fd, deck, 0x11, 1);
+                led_send(fd, deck, 0x4d, 1);
+            }
+            return;
+
+        case 0x4d: /* RELOOP/EXIT */
+            if (on) {
+                led_reloop[deck] ^= 1;
+                led_send(fd, deck, 0x4d, led_reloop[deck]);
+
+                if (!led_reloop[deck]) {
+                    led_loop_in[deck] = 0;
+                    led_loop_out[deck] = 0;
+                    led_send(fd, deck, 0x10, 0);
+                    led_send(fd, deck, 0x11, 0);
+
+                    if (led_beat_loop_pad[deck] >= 0) {
+                        int pad_channel =
+                            deck == 0 ? MC_PAD1 : MC_PAD2;
+
+                        led_send(fd, pad_channel,
+                                 0x60 + led_beat_loop_pad[deck], 0);
+                        led_beat_loop_pad[deck] = -1;
+                    }
+                }
+            }
+            return;
+
+        case 0x54: /* CHANNEL CUE */
+            if (on) {
+                led_channel_cue[deck] ^= 1;
+                led_send(fd, deck, 0x54, led_channel_cue[deck]);
+            }
+            return;
+        }
+    }
+
+    if (channel == 6 && note == 0x63) { /* MASTER CUE */
+        if (on) {
+            led_master_cue ^= 1;
+            led_send(fd, 6, 0x63, led_master_cue);
+        }
+        return;
+    }
+
+    if (channel == 4 && note == 0x47) { /* BEAT FX ON/OFF */
+        if (on) {
+            led_beat_fx ^= 1;
+            led_send(fd, 4, 0x47, led_beat_fx);
+        }
+    }
 }
 
 /* ---------------- device discovery ---------------- */
@@ -584,7 +1328,7 @@ static char *find_midi_node(int card)
 static int open_midi(void)
 {
     if (midi_dev)
-        return open(midi_dev, O_RDONLY | O_NONBLOCK);
+        return open(midi_dev, O_RDWR | O_NONBLOCK);
 
     int card = find_ddj_card();
     if (card < 0) {
@@ -597,7 +1341,7 @@ static int open_midi(void)
         return -1;
     }
     logmsg("ddj400: using %s (ALSA card %d)\n", node, card);
-    return open(node, O_RDONLY | O_NONBLOCK);
+    return open(node, O_RDWR | O_NONBLOCK);
 }
 
 static void list_map(void)
@@ -614,7 +1358,7 @@ static void list_map(void)
                notemap[i].ch + 1, notemap[i].note, notemap[i].key,
                notemap[i].send_ch, notemap[i].name);
     printf("pads: note = mode*16 + (pad-1) -> keys 0x%04x..0x%04x "
-           "(modes 0-3 = hot cue/beat loop/beat jump/sampler)\n", K_PAD1, K_PAD1 + 7);
+           "(modes 0-7 = hot cue/pad fx/beat jump/sampler/keyboard/beat loop/key shift)\n", K_PAD1, K_PAD1 + 7);
 }
 
 static void run_device(int fd);
@@ -656,6 +1400,9 @@ int main(int argc, char **argv)
                 send_tap(K_FILTER, ch);
     }
 
+    vu_init_path();
+    native_led_state_init_path();
+
     /* Hot-plug friendly: keep waiting for the controller instead of dying,
      * so the bridge can be started before the DDJ-400 is plugged in. */
     for (;;) {
@@ -667,7 +1414,12 @@ int main(int argc, char **argv)
             sleep(2);
             continue;
         }
+        vu_midi_init(fd);
+        led_midi_init(fd);
+        native_led_state_reset();
         run_device(fd);
+        midi_write3(fd, 0xb0, 0x02, 0);
+        midi_write3(fd, 0xb1, 0x02, 0);
         close(fd);
         logmsg("ddj400: device closed, waiting for reconnect...\n");
         sleep(2);
@@ -694,6 +1446,9 @@ static void run_device(int fd)
         }
         if (pr == 0) {
             jog_tick();
+            vu_tick(fd);
+            native_led_state_tick(fd);
+            pad_led_tick(fd);
             continue;
         }
         n = read(fd, buf, sizeof(buf));
@@ -723,14 +1478,20 @@ static void run_device(int fd)
             need = 2;
             int type = status & 0xF0;
             int ch = status & 0x0F;
-            if (type == 0x90 || type == 0x80)
-                handle_note(ch, d1, (type == 0x90 && b > 0));
+            if (type == 0x90 || type == 0x80) {
+                int on = (type == 0x90 && b > 0);
+                led_handle_input(fd, ch, d1, on);
+                handle_note(ch, d1, on);
+            }
             else if (type == 0xB0)
                 handle_cc(ch, d1, b);
             else if (opt_sniff)
                 logmsg("MIDI ch%d status=0x%02x d1=%d d2=%d\n", ch + 1, status, d1, b);
         }
         jog_tick();
+        vu_tick(fd);
+            native_led_state_tick(fd);
+            pad_led_tick(fd);
     }
     return;
 }
