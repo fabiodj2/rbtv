@@ -36,3 +36,15 @@ usados no baseline validado.
 - PLAY pisca durante pausa ou espera no CUE.
 - CUE permanece aceso quando existe uma faixa carregada.
 - O estado é reafirmado a cada 500 ms para evitar divergência local da DDJ-400.
+
+## Exclusão persistente de Hot Cues
+
+- `SHIFT + Pad 1..8` exclui o Hot Cue correspondente.
+- A exclusão atualiza imediatamente a interface e o estado do engine.
+- A alteração é persistida no banco Rekordbox do pendrive.
+- Os Hot Cues permanecem apagados após trocar e recarregar a faixa.
+- O worker da DDJ apenas enfileira a solicitação.
+- A operação nativa é executada pelo `Ui_EventTask`, acordado por `set_flg`.
+- Esse dispatch evita contenção entre o worker e a interface de navegação.
+- Navegação da biblioteca validada sem lentidão após a gravação.
+- Core validado: `27640e3dcd1071c370182ba80eb592716333c3a1`.

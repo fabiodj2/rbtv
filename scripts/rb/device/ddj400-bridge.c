@@ -435,6 +435,8 @@ static void pad_select_bank(int deck, int ddj_mode)
                rx3_bank, key);
 }
 
+#define STEMS_PAD_HOTCUE_DELETE_BASE 0x10
+
 static void stems_pad_send_command(int deck, int control);
 
 static void handle_pad(int deck, int note, int on, int shifted)
@@ -461,29 +463,18 @@ static void handle_pad(int deck, int note, int on, int shifted)
     pad_select_bank(deck, mode);
 
     /*
-     * A DDJ-400 envia SHIFT+PAD pelo canal MIDI alternativo.
-     * No banco Hot Cue, reproduzir a operação nativa:
-     *
-     *   press:   CueDelete press -> Pad press
-     *   release: Pad release -> CueDelete release
+     * SHIFT + HOT CUE usa a função nativa de exclusão dentro do RBP.
+     * Somente a borda de pressão gera o comando; a liberação é consumida.
      */
     if (shifted && mode == 0) {
-        if (on) {
-            send_ctrl(K_CUEDELETE, OP_PRESS,
-                      deck + 1, 0, 0.0f, 0);
-            send_ctrl(K_PAD1 + idx, OP_PRESS,
-                      deck + 1, 0, 0.0f, 0);
-        } else {
-            send_ctrl(K_PAD1 + idx, OP_RELEASE,
-                      deck + 1, 0, 0.0f, 0);
-            send_ctrl(K_CUEDELETE, OP_RELEASE,
-                      deck + 1, 0, 0.0f, 0);
-        }
+        if (on)
+            stems_pad_send_command(
+                deck, STEMS_PAD_HOTCUE_DELETE_BASE + idx);
 
         if (opt_verbose)
-            logmsg("  HOT CUE DELETE deck%d pad%d %s\n",
+            logmsg("  HOT CUE NATIVE DELETE deck%d pad%d %s\n",
                    deck + 1, idx + 1,
-                   on ? "press" : "release");
+                   on ? "request" : "release");
         return;
     }
 

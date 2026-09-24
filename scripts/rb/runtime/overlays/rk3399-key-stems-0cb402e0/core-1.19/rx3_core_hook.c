@@ -2039,6 +2039,318 @@ struct stems_pad_state_packet {
     uint8_t armed[2];
 };
 
+
+#define STEMS_PAD_HOTCUE_DELETE_BASE 0x10u
+#define DJENGINE_CLEAR_HOTCUE_ADDR 0x00048a48u
+#define DJENGINE_IS_REGISTERED_HOTCUE_ADDR 0x00048b00u
+#define PLAYER_NOTIFY_HOTCUE_UPDATE_ADDR 0x002f3a70u
+#define PLAYER_HOTCUE_DELETE_EVENT_ADDR 0x002fb328u
+#define PLAYER_NOTIFY_CUE_DELETE_RESULT_ADDR 0x002f30ccu
+#define PLAYER_CTOR_ADDR 0x002f7e90u
+
+typedef void (*clear_hotcue_fn)(
+    void *instance, unsigned int channel, unsigned int cue_type);
+typedef int (*is_registered_hotcue_fn)(
+    const void *instance, unsigned int channel, unsigned int cue_type);
+
+#define DBPROXY_DELETE_CUE_ADDR ((unsigned long)0x0033cfec)
+
+typedef int (*dbproxy_delete_cue_fn)(
+    int channel,
+    unsigned long music_lo,
+    unsigned long music_hi,
+    const void *cue_info);
+
+static dbproxy_delete_cue_fn original_dbproxy_delete_cue;
+static struct installed_hook dbproxy_delete_cue_hook;
+
+static int hooked_dbproxy_delete_cue(
+    int channel,
+    unsigned long music_lo,
+    unsigned long music_hi,
+    const void *cue_info)
+{
+    log_number("HOT CUE DB request channel = ", (unsigned long)channel);
+    log_number("HOT CUE DB request music_lo = ", music_lo);
+    log_number("HOT CUE DB request music_hi = ", music_hi);
+    log_number("HOT CUE DB request cue_ptr = ",
+               (unsigned long)cue_info);
+
+    int result = original_dbproxy_delete_cue(
+        channel, music_lo, music_hi, cue_info);
+
+    log_number("HOT CUE DB request return = ",
+               (unsigned long)result);
+    return result;
+}
+
+typedef void (*player_ctor_fn)(
+    void *player, unsigned int channel, const char *name);
+typedef void (*notify_hotcue_update_fn)(
+    void *player, const void *music_id,
+    unsigned int cue_type, const void *cue_info);
+typedef void (*hotcue_delete_event_fn)(
+    void *player, unsigned int cue_type);
+typedef void (*notify_cue_delete_result_fn)(
+    void *player, int cue_type, int result);
+
+static void *volatile hotcue_players[2];
+static notify_cue_delete_result_fn original_notify_cue_delete_result;
+static struct installed_hook notify_cue_delete_result_hook;
+static player_ctor_fn original_player_ctor;
+static notify_hotcue_update_fn original_notify_hotcue_update;
+static struct installed_hook player_ctor_hook;
+static struct installed_hook notify_hotcue_update_hook;
+
+static int hotcue_deck_for_ui_channel(unsigned int channel)
+{
+    /*
+     * uif::UiObject::Channel is one-based:
+     * channel 1 -> left/engine deck 0;
+     * channel 2 -> right/engine deck 1.
+     */
+    return channel == 1u ? 0 :
+           channel == 2u ? 1 : -1;
+}
+
+static void capture_hotcue_player(
+    void *player, unsigned int channel, const char *source)
+{
+    int deck = hotcue_deck_for_ui_channel(channel);
+
+    if (!player || deck < 0)
+        return;
+
+    if (hotcue_players[deck] != player) {
+        hotcue_players[deck] = player;
+        __sync_synchronize();
+        log_number(source, (unsigned long)deck + 1u);
+    }
+}
+
+static void hooked_notify_cue_delete_result(
+    void *player, int cue_type, int result)
+{
+    unsigned int channel = 0u;
+    int deck = -1;
+
+    if (player) {
+        channel = *((const uint8_t *)player + 0x26u);
+        deck = hotcue_deck_for_ui_channel(channel);
+    }
+
+    log_number("HOT CUE DB result cue = ",
+               (unsigned long)(cue_type > 0 ? cue_type : 0));
+    log_number("HOT CUE DB result success = ",
+               (unsigned long)(result != 0));
+    if (deck >= 0)
+        log_number("HOT CUE DB result deck = ",
+                   (unsigned long)deck + 1u);
+
+    original_notify_cue_delete_result(player, cue_type, result);
+}
+
+static void hooked_player_ctor(
+    void *player, unsigned int channel, const char *name)
+{
+    original_player_ctor(player, channel, name);
+    capture_hotcue_player(
+        player, channel,
+        "HOT CUE constructor captured deck = ");
+}
+
+static void hooked_notify_hotcue_update(
+    void *player, const void *music_id,
+    unsigned int cue_type, const void *cue_info)
+{
+    if (player)
+        capture_hotcue_player(
+            player,
+            *((const uint8_t *)player + 0x26u),
+            "HOT CUE notification captured deck = ");
+
+    original_notify_hotcue_update(
+        player, music_id, cue_type, cue_info);
+}
+
+static int native_hotcue_delete(unsigned int deck, unsigned int pad)
+{
+    const volatile uint32_t *clear_code =
+        (const volatile uint32_t *)(unsigned long)
+            DJENGINE_CLEAR_HOTCUE_ADDR;
+    const volatile uint32_t *registered_code =
+        (const volatile uint32_t *)(unsigned long)
+            DJENGINE_IS_REGISTERED_HOTCUE_ADDR;
+    const volatile uint32_t *delete_event_code =
+        (const volatile uint32_t *)(unsigned long)
+            PLAYER_HOTCUE_DELETE_EVENT_ADDR;
+
+    if (deck >= 2u || pad >= 8u)
+        return 0;
+
+    /*
+     * Firmware guard for:
+     *   push {r4,r5,r6,r7,r8,lr}
+     *   mov  r5,r1
+     */
+    if (clear_code[0] != 0xe92d41f0u ||
+        clear_code[1] != 0xe1a05001u ||
+        registered_code[0] != 0xe92d41f0u ||
+        registered_code[1] != 0xe1a05001u ||
+        delete_event_code[0] != 0xe3510001u ||
+        delete_event_code[1] != 0xe92d41f0u) {
+        log_line("HOT CUE delete rejected: native guard mismatch");
+        return 0;
+    }
+
+    is_registered_hotcue_fn is_registered =
+        (is_registered_hotcue_fn)(unsigned long)
+            DJENGINE_IS_REGISTERED_HOTCUE_ADDR;
+    clear_hotcue_fn clear_hotcue =
+        (clear_hotcue_fn)(unsigned long)
+            DJENGINE_CLEAR_HOTCUE_ADDR;
+
+    /* EnCueType uses 1..8 for pads 1..8. */
+    unsigned int cue_type = pad + 1u;
+
+    if (!is_registered(0, deck, cue_type)) {
+        log_number("HOT CUE delete ignored, empty pad = ", cue_type);
+        return 0;
+    }
+
+    __sync_synchronize();
+    void *player = hotcue_players[deck];
+
+    /*
+     * Do not perform a temporary engine-only deletion when the ui::Player
+     * needed to update rekordbox storage has not been captured.
+     */
+    if (!player) {
+        log_number("HOT CUE delete rejected, player unavailable deck = ",
+                   deck + 1u);
+        return 0;
+    }
+
+    /*
+     * Persist first while CueInfo still has its active state (+0x24 == 2).
+     * Clearing the engine before this event makes ui::Player return early
+     * and prevents DbProxy::deleteCue from reaching Rekordbox.
+     */
+    ((hotcue_delete_event_fn)(unsigned long)
+        PLAYER_HOTCUE_DELETE_EVENT_ADDR)(player, cue_type);
+
+    clear_hotcue(0, deck, cue_type);
+
+    log_number("HOT CUE deleted on deck = ", deck + 1u);
+    log_number("HOT CUE deleted pad = ", cue_type);
+    return 1;
+}
+
+
+#define HOTCUE_BROWSE_KEY_PUMP_ADDR \
+    ((unsigned long)0x001210bcu)
+#define HOTCUE_SET_FLG_ADDR \
+    ((unsigned long)0x00175bb8u)
+#define HOTCUE_BROWSE_EVENT_FLAG_ID_ADDR \
+    ((unsigned long)0x032671f4u)
+#define HOTCUE_BROWSE_EVENT_FLAG_KEY 1u
+#define HOTCUE_DELETE_QUEUE_SIZE 8u
+#define HOTCUE_DELETE_QUEUE_MASK (HOTCUE_DELETE_QUEUE_SIZE - 1u)
+
+typedef int (*hotcue_browse_key_pump_fn)(void);
+typedef int (*hotcue_set_flg_fn)(int, unsigned int);
+
+struct hotcue_delete_request {
+    uint8_t deck;
+    uint8_t pad;
+};
+
+static hotcue_browse_key_pump_fn original_hotcue_browse_key_pump;
+static struct installed_hook hotcue_browse_key_pump_hook;
+static struct hotcue_delete_request
+    hotcue_delete_queue[HOTCUE_DELETE_QUEUE_SIZE];
+static volatile unsigned int hotcue_delete_queue_head;
+static volatile unsigned int hotcue_delete_queue_tail;
+static volatile unsigned int hotcue_ui_dispatch_ready;
+
+static int queue_native_hotcue_delete(unsigned int deck, unsigned int pad)
+{
+    if (deck >= 2u || pad >= 8u || !hotcue_ui_dispatch_ready) {
+        log_line("HOT CUE UI dispatch unavailable");
+        return 0;
+    }
+
+    int event_flag =
+        *(volatile int *)HOTCUE_BROWSE_EVENT_FLAG_ID_ADDR;
+
+    if (event_flag <= 0 || event_flag > 1024) {
+        log_line("HOT CUE UI event flag unavailable");
+        return 0;
+    }
+
+    unsigned int head = hotcue_delete_queue_head;
+    unsigned int next =
+        (head + 1u) & HOTCUE_DELETE_QUEUE_MASK;
+
+    if (next == hotcue_delete_queue_tail) {
+        log_line("HOT CUE UI dispatch queue full");
+        return 0;
+    }
+
+    hotcue_delete_queue[head].deck = (uint8_t)deck;
+    hotcue_delete_queue[head].pad = (uint8_t)pad;
+    __sync_synchronize();
+    hotcue_delete_queue_head = next;
+    __sync_synchronize();
+
+    hotcue_set_flg_fn wake =
+        (hotcue_set_flg_fn)HOTCUE_SET_FLG_ADDR;
+    int result = wake(event_flag, HOTCUE_BROWSE_EVENT_FLAG_KEY);
+
+    log_number("HOT CUE UI dispatch queued deck = ", deck + 1u);
+    log_number("HOT CUE UI dispatch queued pad = ", pad + 1u);
+
+    if (result)
+        log_number("HOT CUE UI event wake result = ",
+                   (unsigned long)result);
+
+    return 1;
+}
+
+static void consume_native_hotcue_deletes(void)
+{
+    for (unsigned int count = 0;
+         count < HOTCUE_DELETE_QUEUE_SIZE;
+         count++) {
+        unsigned int tail = hotcue_delete_queue_tail;
+
+        __sync_synchronize();
+        if (tail == hotcue_delete_queue_head)
+            break;
+
+        struct hotcue_delete_request request =
+            hotcue_delete_queue[tail];
+
+        hotcue_delete_queue_tail =
+            (tail + 1u) & HOTCUE_DELETE_QUEUE_MASK;
+        __sync_synchronize();
+
+        log_number("HOT CUE UI dispatch running deck = ",
+                   (unsigned long)request.deck + 1u);
+        log_number("HOT CUE UI dispatch running pad = ",
+                   (unsigned long)request.pad + 1u);
+
+        (void)native_hotcue_delete(request.deck, request.pad);
+    }
+}
+
+static int hooked_hotcue_browse_key_pump(void)
+{
+    int result = original_hotcue_browse_key_pump();
+    consume_native_hotcue_deletes();
+    return result;
+}
+
 static void stems_panel_activate(unsigned int deck, unsigned int control);
 
 static void *stems_pad_control_thread(void *unused)
@@ -2086,6 +2398,14 @@ static void *stems_pad_control_thread(void *unused)
                 refresh_performance_ui();
                 log_number("DDJ STEMS pad deck = ", command.deck + 1u);
                 log_number("DDJ STEMS pad control = ", command.control + 1u);
+            } else if (
+                command.deck < 2u &&
+                command.control >= STEMS_PAD_HOTCUE_DELETE_BASE &&
+                command.control < STEMS_PAD_HOTCUE_DELETE_BASE + 8u
+            ) {
+                (void)queue_native_hotcue_delete(
+                    command.deck,
+                    command.control - STEMS_PAD_HOTCUE_DELETE_BASE);
             }
         }
 
@@ -2419,8 +2739,96 @@ __attribute__((constructor)) static void initialize(void)
         stems_decks[i].transition_cursor = TRANSITION_FRAMES;
     }
 
-    if (stems_dir)
+    if (stems_dir) {
+        static const uint8_t hotcue_browse_key_pump_guard[8] = {
+            0xf8, 0x40, 0x2d, 0xe9,
+            0x00, 0x40, 0xa0, 0xe3
+        };
+
+        original_hotcue_browse_key_pump =
+            (hotcue_browse_key_pump_fn)install_hook(
+                &hotcue_browse_key_pump_hook,
+                HOTCUE_BROWSE_KEY_PUMP_ADDR,
+                hotcue_browse_key_pump_guard,
+                (void *)hooked_hotcue_browse_key_pump);
+
+        if (original_hotcue_browse_key_pump) {
+            hotcue_ui_dispatch_ready = 1u;
+            log_line("HOT CUE Ui_EventTask dispatch ready");
+        } else {
+            log_line("HOT CUE Ui_EventTask dispatch unavailable");
+        }
+
+        static const uint8_t dbproxy_delete_cue_guard[8] = {
+            0xf0, 0x45, 0x2d, 0xe9,
+            0x00, 0x50, 0xa0, 0xe1
+        };
+
+        original_dbproxy_delete_cue =
+            (dbproxy_delete_cue_fn)install_hook(
+                &dbproxy_delete_cue_hook,
+                DBPROXY_DELETE_CUE_ADDR,
+                dbproxy_delete_cue_guard,
+                (void *)hooked_dbproxy_delete_cue);
+
+        if (original_dbproxy_delete_cue)
+            log_line("HOT CUE DB request telemetry ready");
+        else
+            log_line("HOT CUE DB request telemetry unavailable");
+
+        static const uint8_t notify_hotcue_update_guard[8] = {
+            0x70, 0x43, 0x2d, 0xe9,
+            0x00, 0x40, 0xa0, 0xe1
+        };
+
+        static const uint8_t notify_cue_delete_result_guard[8] = {
+            0xf0, 0x40, 0x2d, 0xe9,
+            0x00, 0x50, 0xa0, 0xe1
+        };
+
+        original_notify_cue_delete_result =
+            (notify_cue_delete_result_fn)install_hook(
+                &notify_cue_delete_result_hook,
+                PLAYER_NOTIFY_CUE_DELETE_RESULT_ADDR,
+                notify_cue_delete_result_guard,
+                (void *)hooked_notify_cue_delete_result);
+
+        if (original_notify_cue_delete_result)
+            log_line("HOT CUE DB result telemetry ready");
+        else
+            log_line("HOT CUE DB result telemetry unavailable");
+
+        static const uint8_t player_ctor_guard[8] = {
+            0xf0, 0x4f, 0x2d, 0xe9,
+            0x01, 0xa0, 0xa0, 0xe1
+        };
+
+        original_player_ctor =
+            (player_ctor_fn)install_hook(
+                &player_ctor_hook,
+                PLAYER_CTOR_ADDR,
+                player_ctor_guard,
+                (void *)hooked_player_ctor);
+
+        if (original_player_ctor)
+            log_line("HOT CUE Player constructor capture ready");
+        else
+            log_line("HOT CUE Player constructor capture unavailable");
+
+        original_notify_hotcue_update =
+            (notify_hotcue_update_fn)install_hook(
+                &notify_hotcue_update_hook,
+                PLAYER_NOTIFY_HOTCUE_UPDATE_ADDR,
+                notify_hotcue_update_guard,
+                (void *)hooked_notify_hotcue_update);
+
+        if (original_notify_hotcue_update)
+            log_line("HOT CUE persistence capture ready");
+        else
+            log_line("HOT CUE persistence capture unavailable");
+
         start_stems_pad_control();
+    }
 
     /* PcmReader::load is the core deck-identity service used independently by
        both features. The remaining audio/pad hooks belong to stems alone. */
