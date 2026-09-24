@@ -1,0 +1,25 @@
+[Unit]
+Description=RX3 RK3399 DDJ-400 runtime
+Documentation=file:/home/orangepi/RX3-RK3399-DDJ400/docs/19-rk3399-key-stems-functional.md
+Wants=network-online.target
+After=local-fs.target sound.target network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+Group=root
+Environment=HOME=/home/orangepi
+WorkingDirectory=/home/orangepi/RX3-RK3399-DDJ400
+ExecStartPre=/bin/sleep 8
+ExecStart=/bin/sh /home/orangepi/RX3-RK3399-DDJ400/scripts/rb/start-rk3399-ddj400.sh start
+ExecStop=/bin/sh /home/orangepi/RX3-RK3399-DDJ400/scripts/rb/start-rk3399-ddj400.sh stop
+TimeoutStartSec=90
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

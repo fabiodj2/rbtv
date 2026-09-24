@@ -65,5 +65,23 @@
       "sha1": "7ead14cdc19246d74db7c48feb8b7fa061f187b1"
     }
   },
-  "private_binary_policy": "Proprietary RBP and compiled runtime binaries remain outside Git."
+  "private_binary_policy": "Proprietary RBP and compiled runtime binaries remain outside Git.",
+  "boot": {
+    "service": "rx3-rk3399-ddj400.service",
+    "unit_path": "scripts/rb/systemd/rx3-rk3399-ddj400.service",
+    "sha256": "25a66e066e8780567ede9a3c0c40be80e0d8d1074cd0b85645ae9167fe362264",
+    "enabled": true,
+    "cold_boot_validated": true,
+    "cold_boot_date": "2026-09-24",
+    "usb_database_ready": true,
+    "single_process_instances": true,
+    "functional_smoke_test": {
+      "audio": true,
+      "keyshift": true,
+      "stems_touchscreen": true,
+      "stems_pads_leds": true,
+      "persistent_hotcue_both_decks": true,
+      "library_navigation": true
+    }
+  }
 }

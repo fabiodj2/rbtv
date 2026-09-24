@@ -48,3 +48,20 @@ usados no baseline validado.
 - Esse dispatch evita contenção entre o worker e a interface de navegação.
 - Navegação da biblioteca validada sem lentidão após a gravação.
 - Core validado: `27640e3dcd1071c370182ba80eb592716333c3a1`.
+
+## Inicialização automática
+
+O runtime funcional é iniciado pelo serviço
+`rx3-rk3399-ddj400.service`, habilitado no `multi-user.target`.
+
+O serviço:
+
+- aguarda a inicialização básica dos dispositivos;
+- inicia EDB, touchscreen, DDJ-400, player e monitor USB;
+- mantém os processos no mesmo cgroup;
+- executa o encerramento pelo launcher principal;
+- preserva a montagem segura do pendrive;
+- foi validado em boot frio em 24 de setembro de 2026.
+
+Após o boot foram validados áudio, KEY, STEMS, pads, LEDs, exclusão
+persistente de Hot Cues nos dois decks e navegação da biblioteca.
