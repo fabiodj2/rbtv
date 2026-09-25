@@ -1,0 +1,10 @@
+[Unit]
+Description=Toggle RX3 graphical interface
+After=local-fs.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/bin/sh /home/orangepi/RX3-RK3399-DDJ400/scripts/rb/toggle-rk3399-interface.sh

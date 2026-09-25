@@ -60,6 +60,16 @@ stop_all()
         'work/build/host/rx3-touch-bridge' 2>/dev/null || true
 
     sleep 2
+
+    echo '=== RESTAURANDO CONSOLE VIRTUAL ==='
+
+    if [ -w /sys/class/vtconsole/vtcon1/bind ]; then
+        echo 1 | sudo tee             /sys/class/vtconsole/vtcon1/bind >/dev/null || true
+    fi
+
+    if command -v chvt >/dev/null 2>&1; then
+        sudo chvt 1 >/dev/null 2>&1 || true
+    fi
 }
 
 case "${1:-start}" in

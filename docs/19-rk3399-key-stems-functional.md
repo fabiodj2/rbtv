@@ -65,3 +65,22 @@ O serviço:
 
 Após o boot foram validados áudio, KEY, STEMS, pads, LEDs, exclusão
 persistente de Hot Cues nos dois decks e navegação da biblioteca.
+
+## Toggle da interface pela DDJ-400
+
+A combinação `SHIFT + BACK` possui dois comportamentos:
+
+- toque curto: executa o BACK normal;
+- pressionada por cinco segundos: alterna a interface entre ON e OFF.
+
+No estado OFF, player, EDB e touchscreen são encerrados. O bridge da
+DDJ-400 e o monitor USB continuam ativos para que a mesma combinação
+possa religar o sistema. O console virtual é restaurado automaticamente.
+
+No estado ON, o runtime completo é reiniciado pelo `systemd`. Áudio,
+KEY, STEMS, pads, LEDs e persistência de Hot Cues são restaurados.
+
+O serviço principal permanece desabilitado no boot. Portanto, após um
+reboot, o runtime precisa ser iniciado manualmente antes que a combinação
+da controladora esteja disponível. A unit `rx3-interface-toggle.path`
+permanece habilitada e não inicia o player por conta própria.

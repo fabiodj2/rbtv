@@ -127,6 +127,14 @@ static int   jog_idle_ms = 60;     /* emit speed 0 after this idle time  */
 
 static int fifo_fd = -1;
 
+#define INTERFACE_TOGGLE_REQUEST \
+    "/run/rx3-interface-toggle.request"
+#define INTERFACE_TOGGLE_HOLD_MS 5000LL
+
+static long long interface_toggle_pressed_ms = -1;
+static int interface_toggle_fired;
+
+
 struct ctrl_ev {
     int32_t key;
     int32_t ch;
@@ -489,6 +497,87 @@ static void handle_pad(int deck, int note, int on, int shifted)
     }
 }
 
+
+static int request_interface_toggle(void)
+{
+    static const char message[] = "toggle\n";
+    int fd = open(
+        INTERFACE_TOGGLE_REQUEST,
+        O_WRONLY | O_CREAT | O_TRUNC,
+        0644
+    );
+
+    if (fd < 0) {
+        logmsg("  interface toggle request failed: %s\n",
+               strerror(errno));
+        return 0;
+    }
+
+    ssize_t written = write(fd, message, sizeof(message) - 1u);
+    close(fd);
+
+    if (written != (ssize_t)(sizeof(message) - 1u)) {
+        logmsg("  interface toggle request incomplete\n");
+        return 0;
+    }
+
+    logmsg("  SHIFT+BACK 5s -> interface toggle requested\n");
+    return 1;
+}
+
+static int handle_interface_toggle_note(int ch, int note, int on)
+{
+    if (ch != MC_MIXER || note != 0x42)
+        return 0;
+
+    if (on) {
+        if (interface_toggle_pressed_ms < 0) {
+            interface_toggle_pressed_ms = now_ms();
+            interface_toggle_fired = 0;
+            logmsg("  SHIFT+BACK hold started\n");
+        }
+        return 1;
+    }
+
+    if (interface_toggle_pressed_ms >= 0 &&
+        !interface_toggle_fired) {
+        long long held =
+            now_ms() - interface_toggle_pressed_ms;
+
+        if (held < INTERFACE_TOGGLE_HOLD_MS) {
+            send_ctrl(
+                K_BACK, OP_PRESS,
+                CH_GLOBAL, 0, 0.0f, 0
+            );
+            send_ctrl(
+                K_BACK, OP_RELEASE,
+                CH_GLOBAL, 0, 0.0f, 0
+            );
+
+            if (opt_verbose)
+                logmsg("  SHIFT+BACK short -> BACK\n");
+        }
+    }
+
+    interface_toggle_pressed_ms = -1;
+    interface_toggle_fired = 0;
+    return 1;
+}
+
+static void interface_toggle_tick(void)
+{
+    if (interface_toggle_pressed_ms < 0 ||
+        interface_toggle_fired)
+        return;
+
+    if (now_ms() - interface_toggle_pressed_ms <
+        INTERFACE_TOGGLE_HOLD_MS)
+        return;
+
+    interface_toggle_fired = 1;
+    (void)request_interface_toggle();
+}
+
 /* ---------------- note mapping table ---------------- */
 struct notemap {
     int ch;
@@ -660,6 +749,8 @@ static void handle_note(int ch, int note, int on)
                ch + 1, note, note, on ? "on" : "off", note_name(ch, note));
         return;
     }
+    if (handle_interface_toggle_note(ch, note, on))
+        return;
     if (ch == MC_FX && handle_beat_fx_select(note, on))
         return;
     if (ch == MC_FX && handle_fxch(note, on))
@@ -1585,6 +1676,7 @@ static void run_device(int fd)
             break;
         }
         if (pr == 0) {
+            interface_toggle_tick();
             jog_tick();
             vu_tick(fd);
             native_led_state_tick(fd);
@@ -1629,6 +1721,7 @@ static void run_device(int fd)
             else if (opt_sniff)
                 logmsg("MIDI ch%d status=0x%02x d1=%d d2=%d\n", ch + 1, status, d1, b);
         }
+        interface_toggle_tick();
         jog_tick();
         vu_tick(fd);
             native_led_state_tick(fd);

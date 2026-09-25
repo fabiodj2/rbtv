@@ -7,8 +7,8 @@
     "rbp_sha256": "f553e21c15520e4a23aa87481d685495415e4b170d4c5abb4e8b54d4e7000bcf",
     "core_sha1": "27640e3dcd1071c370182ba80eb592716333c3a1",
     "core_sha256": "7584e637f573c3c852ac4d289693293cd3f883f79a4a40b07b0cbd641f0d5d2b",
-    "bridge_sha1": "8dbe0b755229def28d1c67ec6cc3a3edc449b29d",
-    "bridge_sha256": "e9c1c4212d3f6b7ad24780292acc6a29c92c9b775681b67ccd2d3694382833c2"
+    "bridge_sha1": "fe1adbeb78e9205523fb75f1d8f835a2c0d2f04b",
+    "bridge_sha256": "d054c8c87e76d2c4c90093983263c73d103b69fc011ba8fdefd67b652b54e394"
   },
   "features": {
     "keyshift": true,
@@ -49,7 +49,21 @@
       "BrowseKeyProcessing hook consumes request",
       "native Player delete event updates rekordbox database",
       "engine hot cue state is cleared"
-    ]
+    ],
+    "interface_toggle": {
+      "controller_action": "SHIFT + BACK held for 5 seconds",
+      "short_press": "native BACK action",
+      "off_behavior": [
+        "stop player",
+        "stop EDB",
+        "stop touchscreen bridge",
+        "keep DDJ bridge active",
+        "keep USB watcher active",
+        "restore virtual console"
+      ],
+      "on_behavior": "restart complete runtime through systemd",
+      "validated": true
+    }
   },
   "assets": {
     "rx3-stems-drums-on.rgb565": {
@@ -67,21 +81,15 @@
   },
   "private_binary_policy": "Proprietary RBP and compiled runtime binaries remain outside Git.",
   "boot": {
-    "service": "rx3-rk3399-ddj400.service",
-    "unit_path": "scripts/rb/systemd/rx3-rk3399-ddj400.service",
-    "sha256": "25a66e066e8780567ede9a3c0c40be80e0d8d1074cd0b85645ae9167fe362264",
-    "enabled": true,
-    "cold_boot_validated": true,
-    "cold_boot_date": "2026-09-24",
-    "usb_database_ready": true,
-    "single_process_instances": true,
-    "functional_smoke_test": {
-      "audio": true,
-      "keyshift": true,
-      "stems_touchscreen": true,
-      "stems_pads_leds": true,
-      "persistent_hotcue_both_decks": true,
-      "library_navigation": true
+    "main_service": "rx3-rk3399-ddj400.service",
+    "main_service_enabled": false,
+    "toggle_path": "rx3-interface-toggle.path",
+    "toggle_path_enabled": true,
+    "note": "The controller toggle is available after the runtime has been started manually because the DDJ bridge must be running.",
+    "units": {
+      "path_sha256": "45d9bb4fb35197efe7af3f29519a68c915f52c94551b001d23d62c05523275a9",
+      "service_sha256": "fccefbacfcff0173863b69a30153f8e30f096428586a4520af94ceed825e1eab",
+      "script_sha256": "67ab4a3074c0afa49dcd7bb757742a19ff653d353ffaba752937789bb94dff26"
     }
   }
 }
