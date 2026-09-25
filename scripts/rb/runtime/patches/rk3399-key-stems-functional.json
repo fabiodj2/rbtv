@@ -91,5 +91,25 @@
       "service_sha256": "fccefbacfcff0173863b69a30153f8e30f096428586a4520af94ceed825e1eab",
       "script_sha256": "67ab4a3074c0afa49dcd7bb757742a19ff653d353ffaba752937789bb94dff26"
     }
+  },
+  "recovery": {
+    "manager": "scripts/rb/runtime/manage-functional-baseline.py",
+    "manager_sha256": "fe018051cade2aed0359402e9c24e50ef0834929bb8b06e31ff710cbd2d957d9",
+    "private_bundle_name": "key-stems-functional-20260924-231104",
+    "bundle_manifest_sha256": "c55c40b23aedfa53dbc7c76316e65b81ea08f2c0ea7790a31df9ec9edd4e54de",
+    "operations": [
+      "status",
+      "verify",
+      "install",
+      "rollback"
+    ],
+    "automatic_rollback_on_install_failure": true,
+    "installation_tested": true,
+    "rollback_tested": true,
+    "service_policy": {
+      "main_service_enabled": false,
+      "toggle_path_enabled": true,
+      "preserve_active_state": true
+    }
   }
 }

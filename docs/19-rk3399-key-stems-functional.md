@@ -84,3 +84,20 @@ O serviço principal permanece desabilitado no boot. Portanto, após um
 reboot, o runtime precisa ser iniciado manualmente antes que a combinação
 da controladora esteja disponível. A unit `rx3-interface-toggle.path`
 permanece habilitada e não inicia o player por conta própria.
+
+## Baseline privado e recuperação
+
+O baseline funcional pode ser preservado em um pacote privado contendo RBP,
+core, bridge, assets visuais, launchers e units do systemd. Os binários
+proprietários e compilados permanecem fora do Git.
+
+O gerenciador versionado está em
+scripts/rb/runtime/manage-functional-baseline.py e oferece as operações
+status, verify, install e rollback.
+
+A instalação valida tamanho, SHA-1 e SHA-256, cria um backup antes de alterar
+o runtime, usa substituição atômica e executa rollback automático em caso de
+falha. Os estados ativo e habilitado dos serviços são preservados.
+
+A instalação idempotente e o rollback foram validados com o serviço principal
+desabilitado no boot, porém ativo, e com o path de toggle habilitado e ativo.
