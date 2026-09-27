@@ -46,6 +46,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <poll.h>
+#include <signal.h>
 #include <time.h>
 #include <dirent.h>
 #include <stdint.h>
@@ -242,12 +243,22 @@ struct cc14 {
     int signed_norm; /* tempo slider: normalise to -1..+1 instead of 0..1 */
     int msb;
     int have_msb;
-    int last10;      /* dedupe */
+    int last10;      /* dedupe / last value actually forwarded */
+
+    /* soft takeover ("pickup"): the engine was primed (by keyshim's
+     * mixer_defaults() or by our own persisted state, see below) to
+     * target10 before the physical control was ever touched this run.
+     * Physical movement is suppressed until it crosses that value, so a
+     * stale hardware position can't yank the mix. */
+    int target10;
+    int picked_up;
+    int last_phys10; /* -1 = no physical sample seen yet this run */
 };
 static struct cc14 cc14[N14];
 static int cc14_n = 0;
 
-static void add_cc14(int ch, int msb_cc, int key, int op, int send_ch, int signed_norm)
+static void add_cc14(int ch, int msb_cc, int key, int op, int send_ch,
+                      int signed_norm, int default10)
 {
     if (cc14_n >= N14)
         return;
@@ -258,7 +269,142 @@ static void add_cc14(int ch, int msb_cc, int key, int op, int send_ch, int signe
     cc14[cc14_n].send_ch = send_ch;
     cc14[cc14_n].signed_norm = signed_norm;
     cc14[cc14_n].last10 = -1;
+    cc14[cc14_n].target10 = default10;
+    cc14[cc14_n].picked_up = 0;
+    cc14[cc14_n].last_phys10 = -1;
     cc14_n++;
+}
+
+/* ---------------- mixer state persistence ----------------
+ * The DDJ-400's pots/faders are plain absolute MIDI controls: they only
+ * transmit on physical movement, so neither the bridge nor the engine has
+ * any way to query a control's current position on startup (this is a
+ * hardware/firmware limitation of the controller itself, not something we
+ * can read around -- confirmed against the official MIDI message list).
+ *
+ * keyshim's mixer_defaults() primes the engine with fixed values (fader
+ * up, trim/EQ/crossfader centred) since the engine's own native defaults
+ * are worse (silence, hard-left). Those fixed values are also this file's
+ * fallback "first ever boot" target below.
+ *
+ * To do better across a normal restart/reboot (controller untouched the
+ * whole time), we persist the last value actually forwarded for each
+ * control to disk (sibling of the control FIFO, so same host-side real
+ * storage keyshim's other telemetry files already use -- NOT /tmp
+ * tmpfs). On the next boot that persisted value replaces the hardcoded
+ * default as the pickup target. The soft-takeover logic in handle_cc14()
+ * (and the FILTER handling in handle_cc()) is kept as a safety net
+ * regardless of where the target came from, in case the controller was
+ * moved while the service/system was down (or this is genuinely the
+ * first boot and no file exists yet). */
+#define MIXER_STATE_MAGIC   0x52334d58UL /* "R3MX" */
+#define MIXER_STATE_VERSION 1
+#define MIXER_STATE_MAX     (N14 + 2)    /* cc14[] entries + FILTER ch1/ch2 */
+
+struct mixer_state_entry {
+    int32_t key;
+    int32_t send_ch;
+    int32_t v10;
+};
+
+struct mixer_state_file {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t count;
+    struct mixer_state_entry entries[MIXER_STATE_MAX];
+};
+
+static void stems_pad_sibling_path(char *output, size_t capacity,
+                                   const char *name);
+
+static char mixer_state_path[512];
+
+/* FILTER (Sound Color FX) is a plain 7-bit CC handled directly in
+ * handle_cc(), not part of cc14[] -- tracked here so it gets the same
+ * persistence/pickup treatment. Index 0 = deck 1, 1 = deck 2. */
+static int filter_target10[2]   = { 512, 512 };
+static int filter_picked_up[2]  = { 0, 0 };
+static int filter_last_phys10[2] = { -1, -1 };
+static int filter_last10[2]     = { -1, -1 };
+
+static void mixer_state_init_path(void)
+{
+    stems_pad_sibling_path(mixer_state_path, sizeof(mixer_state_path),
+                           "rx3-mixer-state.bin");
+    if (opt_verbose)
+        logmsg("ddj400: mixer state %s\n", mixer_state_path);
+}
+
+static void mixer_state_save(void)
+{
+    struct mixer_state_file file;
+    int n = 0;
+
+    memset(&file, 0, sizeof(file));
+    file.magic = MIXER_STATE_MAGIC;
+    file.version = MIXER_STATE_VERSION;
+
+    for (int i = 0; i < cc14_n && n < MIXER_STATE_MAX; i++) {
+        struct cc14 *s = &cc14[i];
+        file.entries[n].key = s->key;
+        file.entries[n].send_ch = s->send_ch;
+        file.entries[n].v10 = (s->last10 >= 0) ? s->last10 : s->target10;
+        n++;
+    }
+    for (int ch = 0; ch < 2 && n < MIXER_STATE_MAX; ch++) {
+        file.entries[n].key = K_COLOR;
+        file.entries[n].send_ch = ch + 1;
+        file.entries[n].v10 =
+            (filter_last10[ch] >= 0) ? filter_last10[ch] : filter_target10[ch];
+        n++;
+    }
+    file.count = (uint16_t)n;
+
+    int fd = open(mixer_state_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return;
+    (void)!write(fd, &file, sizeof(file));
+    close(fd);
+}
+
+static void mixer_state_load(void)
+{
+    struct mixer_state_file file;
+    int fd = open(mixer_state_path, O_RDONLY);
+    if (fd < 0)
+        return;
+    ssize_t n = read(fd, &file, sizeof(file));
+    close(fd);
+    if (n != (ssize_t)sizeof(file) ||
+        file.magic != MIXER_STATE_MAGIC ||
+        file.version != MIXER_STATE_VERSION)
+        return;
+
+    int count = file.count;
+    if (count > MIXER_STATE_MAX)
+        count = MIXER_STATE_MAX;
+
+    for (int e = 0; e < count; e++) {
+        struct mixer_state_entry *ent = &file.entries[e];
+
+        if (ent->key == K_COLOR) {
+            if (ent->send_ch == 1)
+                filter_target10[0] = ent->v10;
+            else if (ent->send_ch == 2)
+                filter_target10[1] = ent->v10;
+            continue;
+        }
+        for (int i = 0; i < cc14_n; i++) {
+            if (cc14[i].key == ent->key && cc14[i].send_ch == ent->send_ch) {
+                cc14[i].target10 = ent->v10;
+                break;
+            }
+        }
+    }
+
+    if (opt_verbose)
+        logmsg("ddj400: loaded %d persisted mixer control(s) from %s\n",
+               count, mixer_state_path);
 }
 
 static int handle_cc14(int ch, int cc, int val)
@@ -287,9 +433,31 @@ static int handle_cc14(int ch, int cc, int val)
             }
             if (v10 < 0) v10 = 0;
             if (v10 > 1023) v10 = 1023;
+
+            if (!s->picked_up) {
+                int crossed;
+                if (s->last_phys10 < 0)
+                    crossed = (v10 == s->target10);
+                else
+                    crossed = (s->last_phys10 <= s->target10 && v10 >= s->target10) ||
+                              (s->last_phys10 >= s->target10 && v10 <= s->target10);
+                s->last_phys10 = v10;
+                if (!crossed) {
+                    if (opt_verbose)
+                        logmsg("  key=0x%04x ch%d pickup pending phys=%d target=%d\n",
+                               s->key, s->send_ch, v10, s->target10);
+                    return 1;
+                }
+                s->picked_up = 1;
+                if (opt_verbose)
+                    logmsg("  key=0x%04x ch%d pickup engaged at v10=%d\n",
+                           s->key, s->send_ch, v10);
+            }
+
             if (v10 != s->last10) {
                 s->last10 = v10;
                 send_ctrl(s->key, s->op, s->send_ch, v10, norm, pos);
+                mixer_state_save();
                 if (opt_verbose)
                     logmsg("  key=0x%04x ch%d pos=%d norm=%.3f v10=%d\n",
                            s->key, s->send_ch, pos, (double)norm, v10);
@@ -304,26 +472,34 @@ static void build_cc14(void)
 {
     /* mixer channel strips (deck channel == send channel).
      * Live-verified on this engine: faders/EQ/trim/crossfader/cue knobs are
-     * driven with OP_ROTATE + 10-bit param (+ normalised float). */
-    add_cc14(MC_DECK1, 0x13, K_FADER,  OP_ROTATE, 1, 0);
-    add_cc14(MC_DECK2, 0x13, K_FADER,  OP_ROTATE, 2, 0);
-    add_cc14(MC_DECK1, 0x04, K_TRIM,   OP_ROTATE, 1, 0);
-    add_cc14(MC_DECK2, 0x04, K_TRIM,   OP_ROTATE, 2, 0);
-    add_cc14(MC_DECK1, 0x07, K_EQH,    OP_ROTATE, 1, 0);
-    add_cc14(MC_DECK2, 0x07, K_EQH,    OP_ROTATE, 2, 0);
-    add_cc14(MC_DECK1, 0x0B, K_EQM,    OP_ROTATE, 1, 0);
-    add_cc14(MC_DECK2, 0x0B, K_EQM,    OP_ROTATE, 2, 0);
-    add_cc14(MC_DECK1, 0x0F, K_EQL,    OP_ROTATE, 1, 0);
-    add_cc14(MC_DECK2, 0x0F, K_EQL,    OP_ROTATE, 2, 0);
+     * driven with OP_ROTATE + 10-bit param (+ normalised float).
+     *
+     * The trailing arg is the pickup target used until a persisted value
+     * is loaded (mixer_state_load(), called from main() right after this):
+     * it matches keyshim's mixer_defaults() (fader up, trim/EQ/crossfader
+     * centred) for the controls that function actually primes, and a
+     * best-guess centre for the ones it doesn't touch (HP mix/level, beat
+     * FX depth) -- soft takeover makes a wrong guess self-correcting on
+     * first touch either way, so exactness here isn't load-bearing. */
+    add_cc14(MC_DECK1, 0x13, K_FADER,  OP_ROTATE, 1, 0, 1023);
+    add_cc14(MC_DECK2, 0x13, K_FADER,  OP_ROTATE, 2, 0, 1023);
+    add_cc14(MC_DECK1, 0x04, K_TRIM,   OP_ROTATE, 1, 0, 512);
+    add_cc14(MC_DECK2, 0x04, K_TRIM,   OP_ROTATE, 2, 0, 512);
+    add_cc14(MC_DECK1, 0x07, K_EQH,    OP_ROTATE, 1, 0, 512);
+    add_cc14(MC_DECK2, 0x07, K_EQH,    OP_ROTATE, 2, 0, 512);
+    add_cc14(MC_DECK1, 0x0B, K_EQM,    OP_ROTATE, 1, 0, 512);
+    add_cc14(MC_DECK2, 0x0B, K_EQM,    OP_ROTATE, 2, 0, 512);
+    add_cc14(MC_DECK1, 0x0F, K_EQL,    OP_ROTATE, 1, 0, 512);
+    add_cc14(MC_DECK2, 0x0F, K_EQL,    OP_ROTATE, 2, 0, 512);
     /* tempo slider: OP_VALUE, signed normalised [-1 = slow .. +1 = fast] */
-    add_cc14(MC_DECK1, 0x00, K_TEMPO_SLIDER, OP_VALUE, 1, 1);
-    add_cc14(MC_DECK2, 0x00, K_TEMPO_SLIDER, OP_VALUE, 2, 1);
+    add_cc14(MC_DECK1, 0x00, K_TEMPO_SLIDER, OP_VALUE, 1, 1, 512);
+    add_cc14(MC_DECK2, 0x00, K_TEMPO_SLIDER, OP_VALUE, 2, 1, 512);
     /* master section (ch 7) */
-    add_cc14(MC_MIXER, 0x1F, K_XFADER,  OP_ROTATE, CH_GLOBAL, 0);
-    add_cc14(MC_MIXER, 0x0C, K_HPMIX,   OP_ROTATE, CH_GLOBAL, 0);
-    add_cc14(MC_MIXER, 0x0D, K_HPLEVEL, OP_ROTATE, CH_GLOBAL, 0);
+    add_cc14(MC_MIXER, 0x1F, K_XFADER,  OP_ROTATE, CH_GLOBAL, 0, 512);
+    add_cc14(MC_MIXER, 0x0C, K_HPMIX,   OP_ROTATE, CH_GLOBAL, 0, 512);
+    add_cc14(MC_MIXER, 0x0D, K_HPLEVEL, OP_ROTATE, CH_GLOBAL, 0, 512);
     /* LEVEL/DEPTH: CC14 0x02/0x22, resolução 0..16383. */
-    add_cc14(MC_FX, 0x02, K_DEPTH, OP_VALUE, CH_GLOBAL, 0);
+    add_cc14(MC_FX, 0x02, K_DEPTH, OP_VALUE, CH_GLOBAL, 0, 512);
 }
 
 /* ---------------- jog wheels ---------------- */
@@ -881,7 +1057,29 @@ static void handle_cc(int ch, int cc, int val)
     /* 7-bit absolute controls */
     if (ch == MC_MIXER && (cc == 0x17 || cc == 0x18)) {   /* FILTER ch1 / ch2 */
         int sch = (cc == 0x17) ? 1 : 2;
-        send_ctrl(K_COLOR, OP_VALUE, sch, cc_to_10bit(val), (float)val / 127.0f, val);
+        int idx = sch - 1;
+        int v10 = cc_to_10bit(val);
+
+        if (!filter_picked_up[idx]) {
+            int crossed;
+            if (filter_last_phys10[idx] < 0)
+                crossed = (v10 == filter_target10[idx]);
+            else
+                crossed = (filter_last_phys10[idx] <= filter_target10[idx] && v10 >= filter_target10[idx]) ||
+                          (filter_last_phys10[idx] >= filter_target10[idx] && v10 <= filter_target10[idx]);
+            filter_last_phys10[idx] = v10;
+            if (!crossed) {
+                if (opt_verbose)
+                    logmsg("  filter ch%d pickup pending phys=%d target=%d\n",
+                           sch, v10, filter_target10[idx]);
+                return;
+            }
+            filter_picked_up[idx] = 1;
+        }
+
+        filter_last10[idx] = v10;
+        send_ctrl(K_COLOR, OP_VALUE, sch, v10, (float)val / 127.0f, val);
+        mixer_state_save();
         if (opt_verbose)
             logmsg("  filter ch%d val=%d\n", sch, val);
         return;
@@ -1758,6 +1956,18 @@ static void list_map(void)
 
 static void run_device(int fd);
 
+/* Set on SIGTERM/SIGINT (systemd's ExecStop, or an interactive Ctrl-C) so
+ * the poll loops can flush mixer_state_save() and exit cleanly instead of
+ * either losing the last values or being mistaken for "controller
+ * unplugged" and looping into a reconnect wait. */
+static volatile sig_atomic_t g_shutdown;
+
+static void handle_shutdown_signal(int sig)
+{
+    (void)sig;
+    g_shutdown = 1;
+}
+
 int main(int argc, char **argv)
 {
     int opt, fd;
@@ -1798,10 +2008,20 @@ int main(int argc, char **argv)
     vu_init_path();
     native_led_state_init_path();
     stems_pad_init_paths();
+    mixer_state_init_path();
+    mixer_state_load();
+
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = handle_shutdown_signal;
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGINT, &sa, NULL);
+    }
 
     /* Hot-plug friendly: keep waiting for the controller instead of dying,
      * so the bridge can be started before the DDJ-400 is plugged in. */
-    for (;;) {
+    while (!g_shutdown) {
         fd = open_midi();
         if (fd < 0) {
             if (midi_dev)
@@ -1817,9 +2037,19 @@ int main(int argc, char **argv)
         midi_write3(fd, 0xb0, 0x02, 0);
         midi_write3(fd, 0xb1, 0x02, 0);
         close(fd);
+        if (g_shutdown)
+            break;
         logmsg("ddj400: device closed, waiting for reconnect...\n");
         sleep(2);
     }
+
+    if (!opt_sniff) {
+        mixer_state_save();
+        logmsg("ddj400: shutting down, mixer state saved\n");
+    } else {
+        logmsg("ddj400: shutting down (sniff mode, nothing to save)\n");
+    }
+    return 0;
 }
 
 static void run_device(int fd)
@@ -1827,7 +2057,7 @@ static void run_device(int fd)
     unsigned char buf[512];
     int status = 0, d1 = 0, need = 0;
 
-    for (;;) {
+    while (!g_shutdown) {
         struct pollfd pfd;
         int pr;
         ssize_t n;
