@@ -90,6 +90,9 @@
 #define K_EQL         0x501c
 #define K_FADER       0x501e
 #define K_XFADER      0x6017
+#define K_FADERCURVE  0x6018   /* crossfader curve select, op5 param: confirmed
+                                 * live 0=THRU, 1=normal, 2=sharp/cut, 3=another
+                                 * distinct curve ("wide open") */
 #define K_HPMIX       0x4405
 #define K_HPLEVEL     0x4406
 #define K_COLOR       0x509d
@@ -103,6 +106,9 @@
 #define K_TAP         0x4492
 #define K_CALLNEXT    0x4322
 #define K_CALLPREV    0x4323
+#define K_HPCUECH     0x5020   /* per-channel headphone cue toggle; param ch=1/2 */
+#define K_MASTERCUE   0x4407   /* master headphone cue toggle */
+#define K_SEARCH      0x0205   /* on-screen keyboard / text search */
 
 #define CH_GLOBAL     1
 
@@ -132,7 +138,27 @@ static int fifo_fd = -1;
 #define INTERFACE_TOGGLE_HOLD_MS 5000LL
 
 static long long interface_toggle_pressed_ms = -1;
+
+/* BROWSE push is overloaded: 1st press opens the library, while the browser
+ * is open it selects/enters (K_SELECTOR) instead. LOAD-ing a track or
+ * backing out (SHIFT+push) returns to the deck view, so they reset this
+ * back to "closed". SHIFT+push (handle_interface_toggle_note()) also reads
+ * this: SOURCE (device picker) from the deck view, BACK once browsing. */
+static int browser_open;
+static int browser_press_key = K_BACK;
 static int interface_toggle_fired;
+
+/* SHIFT (note 0x3f) held state per deck, tracked so other channels' note
+ * handlers (e.g. MASTER CUE on MC_MIXER) can tell whether SHIFT is held --
+ * the hardware only auto-renumbers notes *within the same MIDI channel*, so
+ * a deck's SHIFT does not by itself change what MC_MIXER sends. */
+static int shift_held[2];
+
+/* SEARCH (SHIFT+MASTER CUE): toggles the on-screen keyboard. While active,
+ * the MASTER CUE LED blinks at 1Hz so it's obvious search is open. */
+static int search_active;
+static long long search_blink_ms;
+static int search_led_on;
 
 
 struct ctrl_ev {
@@ -381,14 +407,18 @@ static int pad_bank[2] = { -1, -1 };
 static int pad_rx3_bank(int ddj_mode)
 {
     switch (ddj_mode) {
-    case 0: return 0; /* HOT CUE  -> HOT CUE */
-    case 1: return 2; /* PAD FX 1 -> SLIP LOOP */
-    case 2: return 3; /* BEAT JUMP */
-    case 3: return 1; /* SAMPLER  -> BEAT LOOP */
-    case 4: return 0; /* KEYBOARD -> HOT CUE */
-    case 5: return 2; /* PAD FX 2 -> SLIP LOOP */
-    case 6: return 2; /* SHIFT+SAMPLER -> SLIP LOOP */
-    case 7: return 3; /* KEY SHIFT -> BEAT JUMP */
+    case 0: return 0; /* HOT CUE   -> HOT CUE (direct) */
+    case 1: return 2; /* PAD FX 1  -> SLIP LOOP (fallback, no equivalent) */
+    case 2: return 3; /* BEAT JUMP -> BEAT JUMP (direct) */
+    case 3: return 2; /* SAMPLER   -> SLIP LOOP (fallback, no equivalent) */
+    case 4: return 0; /* KEYBOARD  -> HOT CUE (fallback, no equivalent) */
+    case 5: return 2; /* PAD FX 2  -> SLIP LOOP (fallback; unused: STEMS
+                          page is handled separately in handle_pad()) */
+    case 6: return 1; /* BEAT LOOP -> BEAT LOOP (direct -- was wrongly 2/SLIP
+                          LOOP, swapped with SAMPLER above; confirmed live
+                          via raw MIDI capture that note 0x60-0x67 really is
+                          BEAT LOOP, matching the RX3's own native bank) */
+    case 7: return 3; /* KEY SHIFT -> BEAT JUMP (fallback, no equivalent) */
     default:
         return -1;
     }
@@ -460,9 +490,12 @@ static void handle_pad(int deck, int note, int on, int shifted)
     if (idx > 7 || mode > 7)
         return;
 
-    /* PAD FX 2 is the dedicated DDJ STEMS page. Pads 1-3 mirror the
-       touchscreen DRUMS/VOCAL/INST controls; pads 4-8 remain reserved. */
-    if (mode == 5) {
+    /* PAD FX 2 (mode 5) is the dedicated DDJ STEMS page. Mode 7 (KEY SHIFT,
+     * confirmed live: reached via SHIFT+SAMPLER, note 0x6F) has no RX3
+     * equivalent either, and is repurposed as a second entry point into the
+     * same STEMS page, by user request. Pads 1-3 mirror the touchscreen
+     * DRUMS/VOCAL/INST controls; pads 4-8 remain reserved. */
+    if (mode == 5 || mode == 7) {
         if (on && idx < 3)
             stems_pad_send_command(deck, idx);
         return;
@@ -545,17 +578,23 @@ static int handle_interface_toggle_note(int ch, int note, int on)
             now_ms() - interface_toggle_pressed_ms;
 
         if (held < INTERFACE_TOGGLE_HOLD_MS) {
-            send_ctrl(
-                K_BACK, OP_PRESS,
-                CH_GLOBAL, 0, 0.0f, 0
-            );
-            send_ctrl(
-                K_BACK, OP_RELEASE,
-                CH_GLOBAL, 0, 0.0f, 0
-            );
+            /* From the waveform/deck view (browser closed): jump straight
+             * to SOURCE (device picker: USB1/USB2/PC), by user request.
+             * Once actually browsing, keep the normal BACK behaviour. */
+            int key = browser_open ? K_BACK : K_SOURCE;
+
+            send_ctrl(key, OP_PRESS,   CH_GLOBAL, 0, 0.0f, 0);
+            send_ctrl(key, OP_RELEASE, CH_GLOBAL, 0, 0.0f, 0);
+
+            /* SOURCE puts a device (USB1/USB2/PC) on screen, highlighted --
+             * the very next plain push must select it (K_SELECTOR), not
+             * try to "open" again (K_BACK). Without this, picking a device
+             * from SOURCE needed two plain pushes instead of one. */
+            browser_open = 1;
 
             if (opt_verbose)
-                logmsg("  SHIFT+BACK short -> BACK\n");
+                logmsg("  SHIFT+BACK short -> %s\n",
+                       key == K_SOURCE ? "SOURCE" : "BACK");
         }
     }
 
@@ -587,14 +626,15 @@ struct notemap {
     const char *name;
 };
 static const struct notemap notemap[] = {
-    /* DDJ400_REAL_LOAD_NOTES
-     * The hardware emits LOAD as note 0x3f on each deck's MIDI channel.
-     * Keep the older mixer-channel mappings below for compatibility. */
-    { MC_DECK1, 0x3f, K_LOAD, 1, "LOAD deck 1" },
-    { MC_DECK2, 0x3f, K_LOAD, 2, "LOAD deck 2" },
+    /* Note 0x3f on a deck's own channel is NOT load -- it's that deck's
+     * physical SHIFT key (confirmed live via raw MIDI capture: holding it
+     * changes other buttons' note numbers). See led_handle_input() for the
+     * (no-op) handling. LOAD is note 0x46/0x47 on MC_MIXER below. */
 
     /* BROWSER (ch 7) */
-    { MC_MIXER, 0x41, K_SELECTOR, CH_GLOBAL, "BROWSE push (select/enter)" },
+    /* note 0x41 (plain push) is handled in led_handle_input(): it needs
+     * state (1st press opens, later presses select) that this static
+     * table can't express. */
     { MC_MIXER, 0x42, K_BACK,     CH_GLOBAL, "SHIFT+BROWSE push (back)" },
     { MC_MIXER, 0x46, K_LOAD,     1,         "LOAD deck 1" },
     { MC_MIXER, 0x47, K_LOAD,     2,         "LOAD deck 2" },
@@ -634,15 +674,22 @@ static const struct notemap notemap[] = {
     { MC_DECK2, 0x36, K_JOG_TOUCH, 0, "jog plate touch" },
     { MC_DECK1, 0x67, K_JOG_TOUCH, 0, "SHIFT+jog plate touch" },
     { MC_DECK2, 0x67, K_JOG_TOUCH, 0, "SHIFT+jog plate touch" },
-    /* pad mode buttons */
+    /* pad mode buttons. Notes confirmed live via raw MIDI capture (2026-09-27):
+     * HOT CUE=0x1B, BEAT LOOP=0x6D, BEAT JUMP=0x20, SAMPLER=0x22. The
+     * previous table had 0x1E for "beat loop" (never actually sent by the
+     * hardware -- dead entry) and sent K_ALOOP (beat loop's own reaction)
+     * for SAMPLER's real note (0x22) instead, so pressing SAMPLER wrongly
+     * triggered a beat-loop reaction while BEAT LOOP's real button (0x6D)
+     * triggered nothing. Fixed to match pad_rx3_bank()'s fallback choice
+     * (SAMPLER -> SLIP LOOP, no direct RX3 equivalent). */
     { MC_DECK1, 0x1B, K_HOTCUE,   0, "PAD MODE hot cue" },
     { MC_DECK2, 0x1B, K_HOTCUE,   0, "PAD MODE hot cue" },
-    { MC_DECK1, 0x1E, K_ALOOP,    0, "PAD MODE beat loop" },
-    { MC_DECK2, 0x1E, K_ALOOP,    0, "PAD MODE beat loop" },
+    { MC_DECK1, 0x6D, K_ALOOP,    0, "PAD MODE beat loop" },
+    { MC_DECK2, 0x6D, K_ALOOP,    0, "PAD MODE beat loop" },
     { MC_DECK1, 0x20, K_BEATJUMP, 0, "PAD MODE beat jump" },
     { MC_DECK2, 0x20, K_BEATJUMP, 0, "PAD MODE beat jump" },
-    { MC_DECK1, 0x22, K_ALOOP, 0, "PAD MODE sampler -> beat loop" },
-    { MC_DECK2, 0x22, K_ALOOP, 0, "PAD MODE sampler -> beat loop" },
+    { MC_DECK1, 0x22, K_SLIPLOOP, 0, "PAD MODE sampler -> slip loop" },
+    { MC_DECK2, 0x22, K_SLIPLOOP, 0, "PAD MODE sampler -> slip loop" },
     /* BEAT FX (canal MIDI 5; verificado por captura física) */
     { MC_FX, 0x63, K_BFXTYPE,  CH_GLOBAL, "BEAT FX select" },
     { MC_FX, 0x4A, K_BEATPREV, CH_GLOBAL, "BEAT FX beat <" },
@@ -715,6 +762,24 @@ static int handle_fxch(int note, int on)
 
     if (!on)
         return 1;
+
+    /* SHIFT+FX channel select: crossfader curve, by user request. Confirmed
+     * live (raw MIDI capture) that SHIFT does not renumber these notes --
+     * unlike MASTER CUE/PLAY/LOAD, so shift_held[] is the only way to tell.
+     * CH1/CH2/MASTER -> curve param 1/2/3 (0=THRU intentionally unused). */
+    if (shift_held[0] || shift_held[1]) {
+        static const int curve_param[3] = { 1, 2, 3 };
+        int idx = (note == 0x10) ? 0 : (note == 0x11) ? 1 : 2;
+
+        send_ctrl(K_FADERCURVE, OP_VALUE, CH_GLOBAL,
+                  curve_param[idx], (float)curve_param[idx], curve_param[idx]);
+
+        if (opt_verbose)
+            logmsg("  SHIFT+FX ch select -> crossfader curve %d\n",
+                   curve_param[idx]);
+
+        return 1;
+    }
 
     if (opt_verbose)
         logmsg("  beat fx channel select -> %d\n", value);
@@ -1246,6 +1311,37 @@ static void pad_led_tick(int fd)
     }
 }
 
+/* Blinks the MASTER CUE LED at 1Hz while SEARCH (SHIFT+MASTER CUE) is
+ * active, so it's obvious the on-screen keyboard is open. */
+static void search_led_tick(int fd)
+{
+    if (!search_active)
+        return;
+
+    long long current = now_ms();
+
+    if (current - search_blink_ms >= 1000) {
+        search_blink_ms = current;
+        search_led_on = !search_led_on;
+        led_send(fd, 6, 0x63, search_led_on);
+    }
+}
+
+/* Turns SEARCH off and restores the MASTER CUE LED. There is no real
+ * feedback from the engine about the on-screen keyboard closing, so this is
+ * called as a best-effort heuristic from any other navigation action
+ * (browsing, backing out, loading) -- better to occasionally stop a blink
+ * too early than to leave it stuck forever after the user left some other
+ * way than pressing SHIFT+MASTER CUE again. */
+static void search_cancel(int fd)
+{
+    if (!search_active)
+        return;
+    search_active = 0;
+    search_led_on = 0;
+    led_send(fd, 6, 0x63, led_master_cue);
+}
+
 static void led_clear_deck(int fd, int deck)
 {
     int channel = deck;
@@ -1395,19 +1491,64 @@ static void led_handle_input(int fd, int channel, int note, int on)
         return;
     }
 
-    /* LOAD enviado pelos canais de deck. */
+    /* Note 0x3f on a deck's own channel is that deck's physical SHIFT key
+     * (confirmed live: holding it changes other buttons' note numbers, e.g.
+     * PLAY 0x0b -> 0x47 CENSOR/REVERSE). It carries no meaning by itself for
+     * its own channel -- earlier code wrongly treated it as "LOAD", which
+     * silently reloaded the deck every time SHIFT was held for any other
+     * combo. The real LOAD button is note 0x46/0x47 on MC_MIXER (confirmed
+     * live), handled below. We still track it in shift_held[] because
+     * MC_MIXER controls (e.g. MASTER CUE) need to know SHIFT is held even
+     * though it's on a different MIDI channel. */
     if ((channel == 0 || channel == 1) && note == 0x3f) {
-        if (on)
-            led_loaded(fd, channel);
+        shift_held[channel] = on;
         return;
     }
 
     /* LOAD alternativo enviado pelo canal do browser. */
     if (channel == 6 && (note == 0x46 || note == 0x47)) {
-        if (on)
+        if (on) {
             led_loaded(fd, note == 0x46 ? 0 : 1);
+            browser_open = 0;
+            search_cancel(fd);
+        }
         return;
     }
+
+    /* BROWSE push: 1st press opens the library; while open, press
+     * selects/enters instead. K_SOURCE was tried for the opening press but
+     * it detours through the SOURCE/device-picker screen every time
+     * (confirmed live: press -> SOURCE screen -> press again -> file list).
+     * K_SELECTOR alone was also tried and does nothing from the closed/deck
+     * view. K_BACK (the same key SHIFT+push already sends) goes straight to
+     * the file list, confirmed live -- reused here for the plain push too. */
+    if (channel == MC_MIXER && note == 0x41) {
+        if (on) {
+            browser_press_key = browser_open ? K_SELECTOR : K_BACK;
+            browser_open = 1;
+            search_cancel(fd);
+        }
+        send_ctrl(browser_press_key, on ? OP_PRESS : OP_RELEASE,
+                  CH_GLOBAL, 0, 0.0f, 0);
+        return;
+    }
+
+    /* SHIFT+push resolves to BACK once already browsing (see
+     * handle_interface_toggle_note()) -- that's a reasonable "I'm leaving
+     * search" signal too, so cancel it here where fd is available (that
+     * function doesn't have it). Only on the BACK branch (browser_open==1);
+     * the SOURCE branch is covered by the plain-push case above once the
+     * user actually presses something there. */
+    if (channel == MC_MIXER && note == 0x42 && on && browser_open)
+        search_cancel(fd);
+
+    /* Note 0x42 (SHIFT+push) itself is fully handled in
+     * handle_interface_toggle_note() (called from handle_note(), after this
+     * function): it reads browser_open to choose BACK vs SOURCE and must
+     * see its *current* value, so this function must not touch it here.
+     * (It used to reset browser_open=0 on press, which ran before that
+     * decision and made it always see "closed" -> always send SOURCE,
+     * silently breaking BACK while actually browsing.) */
 
     if (channel == 0 || channel == 1) {
         deck = channel;
@@ -1494,6 +1635,7 @@ static void led_handle_input(int fd, int channel, int note, int on)
             if (on) {
                 led_channel_cue[deck] ^= 1;
                 led_send(fd, deck, 0x54, led_channel_cue[deck]);
+                send_tap(K_HPCUECH, deck + 1);
             }
             return;
         }
@@ -1503,6 +1645,29 @@ static void led_handle_input(int fd, int channel, int note, int on)
         if (on) {
             led_master_cue ^= 1;
             led_send(fd, 6, 0x63, led_master_cue);
+            send_tap(K_MASTERCUE, CH_GLOBAL);
+        }
+        return;
+    }
+
+    /* SHIFT+MASTER CUE: the hardware sends a *different* note (0x78) for
+     * this, not 0x63 with a separate SHIFT flag -- confirmed live via raw
+     * MIDI capture, same pattern as PLAY(0x0b)->CENSOR(0x47) and
+     * LOAD(0x46)->SOURCE(0x68). SEARCH toggle. LED blink is driven by
+     * search_led_tick(); this only sets the trigger. */
+    if (channel == 6 && note == 0x78) {
+        if (on) {
+            search_active = !search_active;
+            if (search_active) {
+                send_tap(K_SEARCH, CH_GLOBAL);
+                search_blink_ms = now_ms();
+                search_led_on = 1;
+                led_send(fd, 6, 0x63, 1);
+            } else {
+                send_tap(K_BACK, CH_GLOBAL);
+                search_led_on = 0;
+                led_send(fd, 6, 0x63, led_master_cue);
+            }
         }
         return;
     }
@@ -1682,6 +1847,7 @@ static void run_device(int fd)
             native_led_state_tick(fd);
             stems_pad_state_tick(fd);
             pad_led_tick(fd);
+            search_led_tick(fd);
             continue;
         }
         n = read(fd, buf, sizeof(buf));
@@ -1727,6 +1893,7 @@ static void run_device(int fd)
             native_led_state_tick(fd);
             stems_pad_state_tick(fd);
             pad_led_tick(fd);
+            search_led_tick(fd);
     }
     return;
 }
