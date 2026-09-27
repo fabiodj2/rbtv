@@ -416,6 +416,7 @@ static int rx3_handle_tagged_pad(const struct ctrl_ev *ev)
     int deck;
     int pad;
     int bank;
+    int actual;
     unsigned char *held;
 
     if ((ev->l & ~7L) != 0x5040L)
@@ -436,13 +437,26 @@ static int rx3_handle_tagged_pad(const struct ctrl_ev *ev)
     held = &rx3_pad_held[deck][pad];
 
     if (ev->op == OP_PRESS) {
-        if (*held == (unsigned char)(bank + 1))
+        actual = rx3_native_pad_mode(deck);
+
+        /* Same *family* as what the bridge asked for (0..3 vs. the
+         * double-click "layer 2" variant 4..7 -- e.g. HOT CUE/GATE CUE,
+         * BEAT LOOP/BEAT LOOP 2 share a family): trust whichever sub-layer
+         * is actually active instead of forcing back to the layer-1 bank.
+         * Forcing unconditionally here used to silently undo the native
+         * double-click toggle (GATE CUE, BEAT LOOP 2, RELEASE FX, ...)
+         * every time a pad was touched. Only force a switch on a genuine
+         * cross-family mismatch (e.g. pads sent while on the wrong mode). */
+        if (actual < 0 || actual % 4 != bank % 4) {
+            if (!rx3_select_pad_bank(deck, bank))
+                return 1;
+            actual = bank;
+        }
+
+        if (*held == (unsigned char)(actual + 1))
             return 1;
 
-        if (!rx3_select_pad_bank(deck, bank))
-            return 1;
-
-        *held = (unsigned char)(bank + 1);
+        *held = (unsigned char)(actual + 1);
 
         send_rx_key_fl(
             ev->key, ev->op, ev->ch,
@@ -452,12 +466,13 @@ static int rx3_handle_tagged_pad(const struct ctrl_ev *ev)
         return 1;
     }
 
-    if (*held != (unsigned char)(bank + 1))
+    if (*held == 0)
         return 1;
 
+    actual = (int)(*held) - 1;
     *held = 0;
 
-    if (rx3_native_pad_mode(deck) != bank)
+    if (rx3_native_pad_mode(deck) != actual)
         return 1;
 
     send_rx_key_fl(
