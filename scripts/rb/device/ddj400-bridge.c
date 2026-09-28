@@ -250,14 +250,13 @@ struct cc14 {
     int have_msb;
     int last10;      /* dedupe / last value actually forwarded */
 
-    /* soft takeover ("pickup"): the engine was primed (by keyshim's
-     * mixer_defaults() or by our own persisted state, see below) to
-     * target10 before the physical control was ever touched this run.
-     * Physical movement is suppressed until it crosses that value, so a
-     * stale hardware position can't yank the mix. */
+    /* Reference value for mixer_state_save(): the loaded-or-default value
+     * to persist if this control is never touched this run, so an
+     * untouched control doesn't lose its last known position across a
+     * restart. Applied immediately on physical input like any other
+     * control -- no pickup/soft-takeover gating (removed by user request:
+     * felt unresponsive waiting for the physical position to cross it). */
     int target10;
-    int picked_up;
-    int last_phys10; /* -1 = no physical sample seen yet this run */
 };
 static struct cc14 cc14[N14];
 static int cc14_n = 0;
@@ -275,8 +274,6 @@ static void add_cc14(int ch, int msb_cc, int key, int op, int send_ch,
     cc14[cc14_n].signed_norm = signed_norm;
     cc14[cc14_n].last10 = -1;
     cc14[cc14_n].target10 = default10;
-    cc14[cc14_n].picked_up = 0;
-    cc14[cc14_n].last_phys10 = -1;
     cc14_n++;
 }
 
@@ -326,10 +323,9 @@ static char mixer_state_path[512];
 
 /* FILTER (Sound Color FX) is a plain 7-bit CC handled directly in
  * handle_cc(), not part of cc14[] -- tracked here so it gets the same
- * persistence/pickup treatment. Index 0 = deck 1, 1 = deck 2. */
+ * persistence treatment. Index 0 = deck 1, 1 = deck 2. target10 is only
+ * the reference value saved if this control is never touched this run. */
 static int filter_target10[2]   = { 512, 512 };
-static int filter_picked_up[2]  = { 0, 0 };
-static int filter_last_phys10[2] = { -1, -1 };
 static int filter_last10[2]     = { -1, -1 };
 
 static void mixer_state_init_path(void)
@@ -439,26 +435,6 @@ static int handle_cc14(int ch, int cc, int val)
             if (v10 < 0) v10 = 0;
             if (v10 > 1023) v10 = 1023;
 
-            if (!s->picked_up) {
-                int crossed;
-                if (s->last_phys10 < 0)
-                    crossed = (v10 == s->target10);
-                else
-                    crossed = (s->last_phys10 <= s->target10 && v10 >= s->target10) ||
-                              (s->last_phys10 >= s->target10 && v10 <= s->target10);
-                s->last_phys10 = v10;
-                if (!crossed) {
-                    if (opt_verbose)
-                        logmsg("  key=0x%04x ch%d pickup pending phys=%d target=%d\n",
-                               s->key, s->send_ch, v10, s->target10);
-                    return 1;
-                }
-                s->picked_up = 1;
-                if (opt_verbose)
-                    logmsg("  key=0x%04x ch%d pickup engaged at v10=%d\n",
-                           s->key, s->send_ch, v10);
-            }
-
             if (v10 != s->last10) {
                 s->last10 = v10;
                 send_ctrl(s->key, s->op, s->send_ch, v10, norm, pos);
@@ -479,13 +455,15 @@ static void build_cc14(void)
      * Live-verified on this engine: faders/EQ/trim/crossfader/cue knobs are
      * driven with OP_ROTATE + 10-bit param (+ normalised float).
      *
-     * The trailing arg is the pickup target used until a persisted value
-     * is loaded (mixer_state_load(), called from main() right after this):
+     * The trailing arg is only the fallback value mixer_state_save()
+     * persists if this control is never touched this run (overwritten by
+     * mixer_state_load() right after this, if a persisted value exists):
      * it matches keyshim's mixer_defaults() (fader up, trim/EQ/crossfader
      * centred) for the controls that function actually primes, and a
      * best-guess centre for the ones it doesn't touch (HP mix/level, beat
-     * FX depth) -- soft takeover makes a wrong guess self-correcting on
-     * first touch either way, so exactness here isn't load-bearing. */
+     * FX depth). Physical input is applied immediately either way -- it's
+     * not a pickup/soft-takeover target, so exactness here isn't
+     * load-bearing. */
     add_cc14(MC_DECK1, 0x13, K_FADER,  OP_ROTATE, 1, 0, 1023);
     add_cc14(MC_DECK2, 0x13, K_FADER,  OP_ROTATE, 2, 0, 1023);
     add_cc14(MC_DECK1, 0x04, K_TRIM,   OP_ROTATE, 1, 0, 512);
@@ -1090,23 +1068,6 @@ static void handle_cc(int ch, int cc, int val)
         int sch = (cc == 0x17) ? 1 : 2;
         int idx = sch - 1;
         int v10 = cc_to_10bit(val);
-
-        if (!filter_picked_up[idx]) {
-            int crossed;
-            if (filter_last_phys10[idx] < 0)
-                crossed = (v10 == filter_target10[idx]);
-            else
-                crossed = (filter_last_phys10[idx] <= filter_target10[idx] && v10 >= filter_target10[idx]) ||
-                          (filter_last_phys10[idx] >= filter_target10[idx] && v10 <= filter_target10[idx]);
-            filter_last_phys10[idx] = v10;
-            if (!crossed) {
-                if (opt_verbose)
-                    logmsg("  filter ch%d pickup pending phys=%d target=%d\n",
-                           sch, v10, filter_target10[idx]);
-                return;
-            }
-            filter_picked_up[idx] = 1;
-        }
 
         filter_last10[idx] = v10;
         send_ctrl(K_COLOR, OP_VALUE, sch, v10, (float)val / 127.0f, val);
