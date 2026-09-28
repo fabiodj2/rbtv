@@ -71,6 +71,11 @@
 #define K_SYNC        0x4112
 #define K_JOG_TOUCH   0x4306
 #define K_JOG_ROT     0x4305
+#define K_SEARCHFWD   0x411f   /* found via onPhysicalKey() dispatch in rbp
+                                 * (not stripped): press/release, hold to
+                                 * scan forward -- adjacent to PAD1..PAD8
+                                 * (0x4117-0x411e) in the keycode space. */
+#define K_SEARCHREV   0x4120
 #define K_TEMPO_RANGE 0x4107
 #define K_MASTER_TEMPO 0x4108
 #define K_TEMPO_SLIDER 0x4109
@@ -542,6 +547,63 @@ static void jog_tick(void)
             continue;
         s->moving = 0;
         send_ctrl(K_JOG_ROT, OP_ROTATE, s->send_ch, 0, 0.0f, (int)s->vpos);
+    }
+}
+
+/* SHIFT+platter (CC 0x29): unlike the plain jog CCs, this is the DDJ-400's
+ * "search" gesture and maps to K_SEARCHFWD/K_SEARCHREV -- discrete
+ * press/release "hold to scan" keys (found live in rbp's onPhysicalKey()
+ * dispatch, not stripped), not a continuous rotate like K_JOG_ROT. A
+ * direction change releases the other key first; releasing happens after
+ * SEARCH_IDLE_MS with no further delta, since the DDJ-400 never sends a
+ * discrete "stopped turning" event of its own. */
+#define SEARCH_IDLE_MS 150
+struct search_state {
+    int midi_ch;
+    int send_ch;
+    int dir;            /* 0 = released, 1 = fwd, -1 = rev */
+    long long last_ms;
+};
+static struct search_state searches[2];
+
+static void search_release(struct search_state *s)
+{
+    send_ctrl(s->dir > 0 ? K_SEARCHFWD : K_SEARCHREV, OP_RELEASE,
+              s->send_ch, 0, 0.0f, 0);
+    s->dir = 0;
+}
+
+static void search_delta(int midi_ch, int delta)
+{
+    struct search_state *s = NULL;
+    for (int i = 0; i < 2; i++)
+        if (searches[i].midi_ch == midi_ch)
+            s = &searches[i];
+    if (!s || delta == 0)
+        return;
+
+    int dir = (delta > 0) ? 1 : -1;
+    s->last_ms = now_ms();
+
+    if (s->dir == dir)
+        return;
+    if (s->dir != 0)
+        search_release(s);
+
+    send_ctrl(dir > 0 ? K_SEARCHFWD : K_SEARCHREV, OP_PRESS,
+              s->send_ch, 0, 0.0f, 0);
+    s->dir = dir;
+    if (opt_verbose)
+        logmsg("  search ch%d dir=%s\n", midi_ch, dir > 0 ? "fwd" : "rev");
+}
+
+static void search_tick(void)
+{
+    long long t = now_ms();
+    for (int i = 0; i < 2; i++) {
+        struct search_state *s = &searches[i];
+        if (s->dir != 0 && t - s->last_ms >= SEARCH_IDLE_MS)
+            search_release(s);
     }
 }
 
@@ -1054,13 +1116,18 @@ static void handle_cc(int ch, int cc, int val)
         return;
     }
 
-    /* jog wheels: CC 0x21 side, 0x22 platter vinyl, 0x23 platter non-vinyl,
-     * 0x29 SHIFT+platter (search).  All relative. */
+    /* jog wheels: CC 0x21 side, 0x22 platter vinyl, 0x23 platter non-vinyl.
+     * All relative, offset-binary around 0x40 (0x3f=-1, 0x40=0, 0x41=+1;
+     * not two's complement). */
     if ((ch == MC_DECK1 || ch == MC_DECK2) &&
-        (cc == 0x21 || cc == 0x22 || cc == 0x23 || cc == 0x29)) {
-        /* Pioneer jog CC is offset-binary around 0x40:
-         * 0x3f=-1, 0x40=0, 0x41=+1. It is not two's complement. */
+        (cc == 0x21 || cc == 0x22 || cc == 0x23)) {
         jog_delta(ch, val - 64);
+        return;
+    }
+
+    /* SHIFT+platter (search) -- see search_delta()/search_tick() above. */
+    if ((ch == MC_DECK1 || ch == MC_DECK2) && cc == 0x29) {
+        search_delta(ch, val - 64);
         return;
     }
 
@@ -2071,6 +2138,8 @@ int main(int argc, char **argv)
     build_cc14();
     jogs[0].midi_ch = MC_DECK1; jogs[0].send_ch = 1;
     jogs[1].midi_ch = MC_DECK2; jogs[1].send_ch = 2;
+    searches[0].midi_ch = MC_DECK1; searches[0].send_ch = 1;
+    searches[1].midi_ch = MC_DECK2; searches[1].send_ch = 2;
 
     logmsg("ddj400-bridge: %s -> %s (jog %g pulses/rev)\n",
            opt_sniff ? "SNIFF (no output)" : "bridge", fifo_path, (double)jog_ppr);
@@ -2153,6 +2222,7 @@ static void run_device(int fd)
         if (pr == 0) {
             interface_toggle_tick();
             jog_tick();
+            search_tick();
             vu_tick(fd);
             native_led_state_tick(fd);
             stems_pad_state_tick(fd);
@@ -2200,6 +2270,7 @@ static void run_device(int fd)
         }
         interface_toggle_tick();
         jog_tick();
+        search_tick();
         vu_tick(fd);
             native_led_state_tick(fd);
             stems_pad_state_tick(fd);
