@@ -880,6 +880,10 @@ static const struct notemap notemap[] = {
     { MC_FX, 0x4A, K_BEATPREV, CH_GLOBAL, "BEAT FX beat <" },
     { MC_FX, 0x4B, K_BEATNEXT, CH_GLOBAL, "BEAT FX beat >" },
     { MC_FX, 0x47, K_BFX,      CH_GLOBAL, "BEAT FX on/off" },
+    /* SHIFT+BEAT ▶ = TAP (confirmed live 2026-09-27: user-labelled "TAP",
+     * manually tap the Beat FX tempo). Note 0x6B is BEAT ▶'s own SHIFT
+     * variant per the official MIDI list, not a separate physical button. */
+    { MC_FX, 0x6B, K_TAP,      CH_GLOBAL, "SHIFT+BEAT FX beat > (TAP)" },
 };
 #define NNMAP ((int)(sizeof(notemap) / sizeof(notemap[0])))
 
