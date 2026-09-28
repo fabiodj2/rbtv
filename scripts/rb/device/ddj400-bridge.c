@@ -341,7 +341,20 @@ static void mixer_state_init_path(void)
         logmsg("ddj400: mixer state %s\n", mixer_state_path);
 }
 
-static void mixer_state_save(void)
+static long long now_ms(void);
+
+/* Debounced: a fast knob/fader sweep can change a value dozens of times a
+ * second, and this used to write the whole struct to disk inline on every
+ * single change -- confirmed live (2026-09-27) as a likely contributor to
+ * audible master-output clicks (real disk I/O competing with the audio
+ * thread on this SBC), most noticeable sweeping the FILTER knob. Callers
+ * just mark state dirty now; mixer_state_tick() flushes at most once per
+ * MIXER_STATE_FLUSH_MS from the main poll loop. */
+#define MIXER_STATE_FLUSH_MS 300
+static int mixer_state_dirty;
+static long long mixer_state_dirty_since;
+
+static void mixer_state_flush(void)
 {
     struct mixer_state_file file;
     int n = 0;
@@ -367,10 +380,26 @@ static void mixer_state_save(void)
     file.count = (uint16_t)n;
 
     int fd = open(mixer_state_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0)
-        return;
-    (void)!write(fd, &file, sizeof(file));
-    close(fd);
+    if (fd >= 0) {
+        (void)!write(fd, &file, sizeof(file));
+        close(fd);
+    }
+    mixer_state_dirty = 0;
+}
+
+static void mixer_state_save(void)
+{
+    if (!mixer_state_dirty) {
+        mixer_state_dirty = 1;
+        mixer_state_dirty_since = now_ms();
+    }
+}
+
+static void mixer_state_tick(void)
+{
+    if (mixer_state_dirty &&
+        now_ms() - mixer_state_dirty_since >= MIXER_STATE_FLUSH_MS)
+        mixer_state_flush();
 }
 
 static void mixer_state_load(void)
@@ -1140,6 +1169,13 @@ static void handle_cc(int ch, int cc, int val)
         int idx = sch - 1;
         int v10 = cc_to_10bit(val);
 
+        /* Dedupe like every cc14[] entry already does -- this was missing
+         * (pre-existing, not just from today's changes) and let a fast
+         * knob sweep flood the control FIFO and (since mixer state
+         * persistence was added) trigger a disk write per MIDI message
+         * instead of per actual value change. */
+        if (v10 == filter_last10[idx])
+            return;
         filter_last10[idx] = v10;
         send_ctrl(K_COLOR, OP_VALUE, sch, v10, (float)val / 127.0f, val);
         mixer_state_save();
@@ -2193,7 +2229,7 @@ int main(int argc, char **argv)
     }
 
     if (!opt_sniff) {
-        mixer_state_save();
+        mixer_state_flush();
         logmsg("ddj400: shutting down, mixer state saved\n");
     } else {
         logmsg("ddj400: shutting down (sniff mode, nothing to save)\n");
@@ -2223,6 +2259,7 @@ static void run_device(int fd)
             interface_toggle_tick();
             jog_tick();
             search_tick();
+            mixer_state_tick();
             vu_tick(fd);
             native_led_state_tick(fd);
             stems_pad_state_tick(fd);
@@ -2271,6 +2308,7 @@ static void run_device(int fd)
         interface_toggle_tick();
         jog_tick();
         search_tick();
+        mixer_state_tick();
         vu_tick(fd);
             native_led_state_tick(fd);
             stems_pad_state_tick(fd);
