@@ -201,25 +201,30 @@ static int mixer_crossfader_assign(void)
  * (same idea as the Prime GO knobshim2 mixer init, SESSION_STATE_12).
  * keycodes: FADER 0x501e, TRIM 0x5019, EQH/M/L 0x501a/b/c, XFADER 0x6017. */
 
-/* Seleciona diretamente o FILTER nativo nos dois canais.
- * O painel original do RX3 faria esta inicialização. */
-static int rx3_native_filter_select(void)
+/* Seleciona o tipo de Sound Color FX nativo num canal (0=deck1, 1=deck2).
+ * O painel original do RX3 teria um seletor de 3 posições ao lado do knob
+ * de Color FX para isso; a DDJ-400 não tem esse seletor físico, só o knob
+ * de valor (ver ddj400-bridge.c, SHIFT+BEAT LOOP). `type` ainda não tem
+ * significado confirmado além de 1=FILTER (única chamada até agora,
+ * sempre nos dois canais, no startup). */
+static int rx3_native_color_fx_select(int deck, int type)
 {
     void *engine = *(void *volatile *)0x0268617cUL;
 
-    if (!engine)
+    if (!engine || deck < 0 || deck > 1)
         return 0;
 
-    ((void (*)(void *, int, int))0x004e2c4UL)(engine, 0, 1);
-    ((void (*)(void *, int, int))0x004e2c4UL)(engine, 1, 1);
+    ((void (*)(void *, int, int))0x004e2c4UL)(engine, deck, type);
 
-    klog_str("keyshim: native FILTER selected deck1/deck2\n");
+    klog_dec("keyshim: native color fx deck=", deck);
+    klog_dec("         type=", type);
     return 1;
 }
 
 static void mixer_defaults(void)
 {
-    rx3_native_filter_select();
+    rx3_native_color_fx_select(0, 1);
+    rx3_native_color_fx_select(1, 1);
     int ch;
     mixer_route();  /* re-assert Input 0->deck1, Input 1->deck2 */
     mixer_crossfader_assign();
@@ -480,6 +485,23 @@ static int rx3_handle_tagged_pad(const struct ctrl_ev *ev)
         ev->param, ev->f, 0
     );
 
+    return 1;
+}
+
+/* Sound Color FX type select: not a real rbp keycode, this value is only
+ * ever meaningful to keyshim itself (see ddj400-bridge.c's PAD FX1 page,
+ * reached via SHIFT+BEAT LOOP). ev->ch = 1/2 (deck), ev->param = type. */
+#define RX3_COLOR_FX_TYPE_SELECT 0x50a7
+
+static int rx3_handle_color_fx_type(const struct ctrl_ev *ev)
+{
+    if (ev->key != RX3_COLOR_FX_TYPE_SELECT || ev->op != OP_VALUE)
+        return 0;
+
+    if (ev->ch < 1 || ev->ch > 2)
+        return 1;
+
+    rx3_native_color_fx_select(ev->ch - 1, ev->param);
     return 1;
 }
 
@@ -890,6 +912,8 @@ static void *ctrl_thread(void *arg)
                 klog_dec("         ch=", ev.ch);
                 klog_dec("         param=", ev.param);
                 if (rx3_handle_tagged_pad(&ev))
+                    continue;
+                if (rx3_handle_color_fx_type(&ev))
                     continue;
 
                 send_rx_key_fl(ev.key, ev.op,

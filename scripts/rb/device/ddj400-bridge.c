@@ -98,6 +98,10 @@
 #define K_HPLEVEL     0x4406
 #define K_COLOR       0x509d
 #define K_FILTER      0x50a6
+#define K_COLOR_TYPE  0x50a7   /* not a real rbp keycode -- keyshim-only,
+                                 * selects the Sound Color FX type (1-6
+                                 * confirmed live 2026-09-27; 0 and 7+ are
+                                 * no-ops). param = type, ch = deck. */
 #define K_BFXTYPE     0x448b
 #define K_BFXCH       0x448c
 #define K_BFX         0x448d
@@ -129,6 +133,7 @@ static int   opt_sniff   = 0;
 static int   opt_filter_init = 0;
 static const char *fifo_path = "/tmp/rb-ctrl.fifo";
 static const char *midi_dev  = NULL;
+static char midi_node_path[128];
 static float jog_ppr = 720.0f;    /* DDJ-400 jog pulses per revolution */
 static int   jog_idle_ms = 60;     /* emit speed 0 after this idle time  */
 
@@ -584,7 +589,10 @@ static int pad_rx3_bank(int ddj_mode)
 {
     switch (ddj_mode) {
     case 0: return 0; /* HOT CUE   -> HOT CUE (direct) */
-    case 1: return 2; /* PAD FX 1  -> SLIP LOOP (fallback, no equivalent) */
+    case 1: return -1; /* PAD FX 1  -> Sound Color FX type select, handled
+                           entirely in handle_pad()/led_handle_input(); never
+                           reaches here (was wrongly falling back to SLIP
+                           LOOP, dead/redundant with SAMPLER below). */
     case 2: return 3; /* BEAT JUMP -> BEAT JUMP (direct) */
     case 3: return 2; /* SAMPLER   -> SLIP LOOP (fallback, no equivalent) */
     case 4: return 0; /* KEYBOARD  -> HOT CUE (fallback, no equivalent) */
@@ -653,6 +661,14 @@ static void pad_select_bank(int deck, int ddj_mode)
 
 static void stems_pad_send_command(int deck, int control);
 
+/* Sound Color FX type select (PAD FX1 page, mode 1, reached via SHIFT+BEAT
+ * LOOP -- note 0x1E, confirmed live 2026-09-27). Types 1-6 are the only
+ * ones confirmed to do anything (0 and 7+ are silent no-ops); pad 0 selects
+ * type 1, ..., pad 5 selects type 6. Per deck, independent of the other. */
+#define COLOR_FX_TYPE_COUNT 6
+static int color_fx_pad_idx[2] = { 0, 0 }; /* type 1 (FILTER), matches
+                                             * keyshim's mixer_defaults() */
+
 static void handle_pad(int deck, int note, int on, int shifted)
 {
     int mode = (note >> 4) & 0x0f;
@@ -674,6 +690,21 @@ static void handle_pad(int deck, int note, int on, int shifted)
     if (mode == 5 || mode == 7) {
         if (on && idx < 3)
             stems_pad_send_command(deck, idx);
+        return;
+    }
+
+    /* PAD FX 1 (mode 1, SHIFT+BEAT LOOP): Sound Color FX type select,
+     * per deck. Pad idx 0..5 -> type 1..6; pads 6/7 unused (types 7+ do
+     * nothing on this engine). LED feedback in led_handle_input(). */
+    if (mode == 1) {
+        if (on && idx < COLOR_FX_TYPE_COUNT) {
+            int type = idx + 1;
+            color_fx_pad_idx[deck] = idx;
+            send_ctrl(K_COLOR_TYPE, OP_VALUE, deck + 1, type, (float)type, 0);
+            if (opt_verbose)
+                logmsg("  Sound Color FX deck%d -> type %d (pad %d)\n",
+                       deck + 1, type, idx + 1);
+        }
         return;
     }
 
@@ -1134,14 +1165,33 @@ static void vu_init_path(void)
 static void midi_write3(int fd, int status, int data1, int data2)
 {
     unsigned char message[3];
+    int tries;
 
     message[0] = (unsigned char)status;
     message[1] = (unsigned char)data1;
     message[2] = (unsigned char)data2;
 
-    if (write(fd, message, sizeof(message)) < 0 &&
-        errno != EAGAIN && errno != EINTR && opt_verbose)
-        logmsg("ddj400: MIDI output failed: %s\n", strerror(errno));
+    /* fd is O_NONBLOCK: a momentary full buffer returns EAGAIN, which used
+     * to be silently swallowed (and never logged, even with -v, since the
+     * old check explicitly excluded EAGAIN/EINTR from the log condition) --
+     * one-shot LED writes like the Sound Color FX pad selection had no
+     * retry, so a single dropped write meant that LED just never lit, with
+     * no trace anywhere. Retry a few times with a short backoff instead. */
+    for (tries = 0; tries < 5; tries++) {
+        ssize_t n = write(fd, message, sizeof(message));
+        if (n == (ssize_t)sizeof(message))
+            return;
+        if (n < 0 && (errno == EAGAIN || errno == EINTR)) {
+            usleep(2000);
+            continue;
+        }
+        if (opt_verbose)
+            logmsg("ddj400: MIDI output failed: %s\n", strerror(errno));
+        return;
+    }
+    if (opt_verbose)
+        logmsg("ddj400: MIDI output dropped after retries (status=0x%02x "
+               "d1=%d d2=%d)\n", status, data1, data2);
 }
 
 static void vu_midi_init(int midi_fd)
@@ -1490,6 +1540,40 @@ static void native_led_state_tick(int midi_fd)
     native_led_force_sync = 0;
 }
 
+/* Sound Color FX LED (PAD FX1 page): sent from the next poll tick instead
+ * of synchronously inline with the triggering note-on, in case writing an
+ * LED command back-to-back with processing the incoming press (same read
+ * burst) confuses this specific hardware page (every other software-level
+ * explanation -- other LED writers, EAGAIN drops, redraw-on-entry -- has
+ * been ruled out live; this is the one difference left vs. the isolated
+ * `amidi` test, which never wrote anything synchronously with a read). */
+static int color_fx_led_shown[2]   = { 0, 0 };
+static int color_fx_led_pending[2] = { -1, -1 };
+static long long color_fx_led_deadline[2];
+
+static void color_fx_led_tick(int fd)
+{
+    long long current = now_ms();
+
+    for (int deck = 0; deck < 2; deck++) {
+        int idx = color_fx_led_pending[deck];
+        int channel;
+        int prev;
+
+        if (idx < 0 || current < color_fx_led_deadline[deck])
+            continue;
+
+        channel = deck == 0 ? MC_PAD1 : MC_PAD2;
+        prev = color_fx_led_shown[deck];
+        color_fx_led_pending[deck] = -1;
+
+        if (prev != idx)
+            led_send(fd, channel, prev, 0);
+        led_send(fd, channel, idx, 1);
+        color_fx_led_shown[deck] = idx;
+    }
+}
+
 /* Apaga Beat Jump um segundo depois sem bloquear o loop MIDI. */
 static void pad_led_tick(int fd)
 {
@@ -1594,6 +1678,18 @@ static void led_midi_init(int fd)
     led_clear_deck(fd, 0);
     led_clear_deck(fd, 1);
 
+    /* Sound Color FX default is type 1 (FILTER, keyshim's mixer_defaults());
+     * light pad 0 in the PAD FX1 page to match, so it's already correct the
+     * first time SHIFT+BEAT LOOP is pressed after startup. */
+    color_fx_pad_idx[0] = 0;
+    color_fx_pad_idx[1] = 0;
+    color_fx_led_shown[0] = 0;
+    color_fx_led_shown[1] = 0;
+    color_fx_led_pending[0] = -1;
+    color_fx_led_pending[1] = -1;
+    led_send(fd, MC_PAD1, 0x10, 1);
+    led_send(fd, MC_PAD2, 0x10, 1);
+
     midi_write3(fd, 0x9f, 0x00, 0);
     midi_write3(fd, 0x9f, 0x01, 0);
 
@@ -1640,6 +1736,22 @@ static void led_handle_input(int fd, int channel, int note, int on)
            Não permita que o release físico sobrescreva o estado confirmado. */
         if (mode == 5)
             return;
+
+        /* Sound Color FX type select (PAD FX1): "radio button" -- só o pad
+         * do tipo ativo fica aceso por deck. Estado é local (nós decidimos o
+         * tipo, não há confirmação nativa pra consultar), então não precisa
+         * de telemetria de volta como o STEMS. */
+        if (mode == 1) {
+            if (on && idx < COLOR_FX_TYPE_COUNT) {
+                if (opt_verbose)
+                    logmsg("  color fx LED deck%d scheduled idx=%d "
+                           "(shown=%d)\n", pad_deck + 1, idx,
+                           color_fx_led_shown[pad_deck]);
+                color_fx_led_pending[pad_deck] = idx;
+                color_fx_led_deadline[pad_deck] = now_ms() + 15;
+            }
+            return;
+        }
 
         /* SHIFT+PAD em Hot Cue: apagar o LED persistente. */
         if (shifted && mode == 0) {
@@ -1920,8 +2032,10 @@ static char *find_midi_node(int card)
 
 static int open_midi(void)
 {
-    if (midi_dev)
+    if (midi_dev) {
+        snprintf(midi_node_path, sizeof(midi_node_path), "%s", midi_dev);
         return open(midi_dev, O_RDWR | O_NONBLOCK);
+    }
 
     int card = find_ddj_card();
     if (card < 0) {
@@ -1933,6 +2047,7 @@ static int open_midi(void)
         logmsg("ddj400: card %d has no rawmidi node in /dev/snd\n", card);
         return -1;
     }
+    snprintf(midi_node_path, sizeof(midi_node_path), "%s", node);
     logmsg("ddj400: using %s (ALSA card %d)\n", node, card);
     return open(node, O_RDWR | O_NONBLOCK);
 }
@@ -2077,6 +2192,7 @@ static void run_device(int fd)
             native_led_state_tick(fd);
             stems_pad_state_tick(fd);
             pad_led_tick(fd);
+            color_fx_led_tick(fd);
             search_led_tick(fd);
             continue;
         }
@@ -2123,6 +2239,7 @@ static void run_device(int fd)
             native_led_state_tick(fd);
             stems_pad_state_tick(fd);
             pad_led_tick(fd);
+            color_fx_led_tick(fd);
             search_led_tick(fd);
     }
     return;
