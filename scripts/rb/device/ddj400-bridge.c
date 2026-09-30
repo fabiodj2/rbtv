@@ -1353,6 +1353,16 @@ static void led_send(int fd, int channel, int note, int enabled)
 #define RX3_LED_MAGIC   0x524c4544UL
 #define RX3_LED_VERSION 1
 
+/* Bits of rx3_led_state_packet.flags[deck], written by keyshim.c from real
+ * native engine state (rx3_native_call1 against onPhysicalKey's own query
+ * functions). Only MASTER_TEMPO is consumed here so far. */
+#define RX3_LED_CUE          0x01
+#define RX3_LED_LOOP         0x02
+#define RX3_LED_RELOOP       0x04
+#define RX3_LED_SYNC_MASTER  0x08
+#define RX3_LED_SYNC_SLAVE   0x10
+#define RX3_LED_MASTER_TEMPO 0x20
+
 struct rx3_led_state_packet {
     uint32_t magic;
     uint16_t version;
@@ -1601,6 +1611,15 @@ static void native_led_state_tick(int midi_fd)
             native_led_cue[deck] != (unsigned char)cue_led) {
             native_led_cue[deck] = (unsigned char)cue_led;
             led_send(midi_fd, deck, 0x0c, cue_led);
+        }
+
+        int master_tempo_led =
+            (packet.flags[deck] & RX3_LED_MASTER_TEMPO) ? 1 : 0;
+
+        if (native_led_force_sync ||
+            led_sync[deck] != (unsigned char)master_tempo_led) {
+            led_sync[deck] = (unsigned char)master_tempo_led;
+            led_send(midi_fd, deck, 0x58, master_tempo_led);
         }
     }
 
@@ -1937,11 +1956,11 @@ static void led_handle_input(int fd, int channel, int note, int on)
             /* O estado real do player é o único proprietário destes LEDs. */
             return;
 
-        case 0x58: /* BEAT SYNC */
-            if (on) {
-                led_sync[deck] ^= 1;
-                led_send(fd, deck, note, led_sync[deck]);
-            }
+        case 0x58: /* BEAT SYNC -> MASTER TEMPO. O estado real do engine
+                    * (RX3_LED_MASTER_TEMPO em native_led_state_tick()) é o
+                    * único dono deste LED; antes era um toggle local que
+                    * divergia do estado real (ex.: no boot, quando o mixer
+                    * state persistido já entra com master tempo ligado). */
             return;
 
         case 0x5c: /* MASTER */
