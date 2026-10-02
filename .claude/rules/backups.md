@@ -3,3 +3,5 @@
 - Target is a clone of fabiodj2/RX3-Orange-PI-4-LTS (`BACKUP_REPO`); one branch per backup: `backup/orangepi-<date>-<label>`; never the default branch.
 - Never store firmware, `rbp` binaries, keys or credentials. Show the script's summary and wait for the user's explicit yes before the push step; never pass `--yes` on the user's behalf.
 - Do not weaken the blocklist or secret scan to make a backup pass; fix the source or ask.
+- Binaries/archives are excluded by default; only add `--allow '<glob>'` for the user's own shims and say so. `--allow` never covers firmware (`rbp*`, rootfs, `.UPD`).
+- First run of a new source: use `--no-push`, show the user `MANIFEST.md`, then push.

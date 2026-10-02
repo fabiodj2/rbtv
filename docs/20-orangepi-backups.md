@@ -17,18 +17,25 @@ Needs `git`, `rsync`, `ssh` (all present on macOS; works with bash 3.2).
 
 ## Each backup
 ```sh
-BACKUP_REPO=~/rx3-orangepi ~/rbtv/scripts/orangepi/backup-pull.sh <label> '<remote-path>' ['<remote-path>' ...]
+BACKUP_REPO=~/rx3-orangepi ~/rbtv/scripts/orangepi/backup-pull.sh [--no-push] [--allow 'glob'] <label> '<remote-path>' ['<remote-path>' ...]
 # example
 BACKUP_REPO=~/rx3-orangepi ~/rbtv/scripts/orangepi/backup-pull.sh rx3-v3-working '~/rx3-handoff' '~/start-rx3.sh'
 ```
-Steps the script performs:
-1. **Pull** over SSH with rsync (read-only on the board), files over `OPI_BACKUP_MAX_SIZE` (default 50m) are skipped and listed.
-2. **Filter** by name and path: firmware (`rbp*`, `*.UPD`, `*.iso`, `*.img*`, `rootfs*`, `*.cramfs`, `export.pdb`, `gui/`, `rbx3-run/`, `rx3-rootfs/`), keys and credentials (`*.pem`, `*.key`, `id_*`, `.ssh/`, `.env*`, `.netrc`, `.credentials.json`, `.claude.json`, wpa/NetworkManager configs, core dumps). Excluded files are **not stored**; only their sha256, size and path go in the manifest (same idea as the md5 table in docs/16).
-3. **Scan** what is left. Strong patterns (private key headers, GitHub/Anthropic/AWS/Slack tokens) abort with exit 3 and nothing is committed. Weaker `password=`/`token:` lines only warn.
-4. **Commit** under `backups/orangepi/<date>-<label>/` (`files/` + `MANIFEST.md` with sha256 of every stored file, system, sources, exclusions) on the new branch, using a temporary worktree.
-5. **Confirm and push.** It shows the summary and asks `Push ... [y/N]`. `--yes` skips the question, except when credential-like lines were found (always asks). `--no-push` keeps the branch local.
+Options: `--no-push` keeps the branch local; `--yes` skips the push question; `--allow '<name-glob>'` (before the label) stores matching binaries/archives such as your own `keyshim*.so`.
+Env: `BACKUP_REPO` is **required**; `BACKUP_EXPECT_REPO` (default `rx3-orange-pi-4-lts`) must appear in the target's origin URL or the script refuses; `OPI_HOST` (default `orangepi`); `OPI_BACKUP_MAX_SIZE` (default 50m).
 
-Exit codes: 2 usage, 3 secret found, 4 branch exists, 5 nothing to commit.
+Steps the script performs:
+1. **Validate** label, host and remote paths. Paths may only contain `A-Za-z0-9._/~+-` (no spaces, no `..`) because older rsync/ssh shells split or execute anything else. Two paths with the same basename are refused.
+2. **Pull** over SSH with rsync (read-only on the board): regular files only (symlinks, devices, FIFOs and `.git/` are not copied), files over the size cap are skipped and listed.
+3. **Filter** (case-insensitive, also for directories at the root of a given path):
+   - *firmware/proprietary*: `rbp*`, `*.UPD`, `*.iso`, `*.img*`, `rootfs*`, `*.cramfs`, `*.pdb`, core dumps, `gui/`, `rbx3-run/`, `rx3-rootfs/`. Only sha256, size and path go in the manifest; `--allow` can never override this.
+   - *credentials*: `.ssh/`, `.gnupg/`, `.config/gh/`, `.aws/`, `.docker/`, `.kube/`, `system-connections/`, wpa configs, `*.pem|key|p12|pfx|ppk|kdbx|nmconnection`, `id_*`, `.env*`, `.netrc`, `.credentials.json`, `.claude.json`. Nothing is recorded, not even names or hashes (SSIDs and low-entropy secrets).
+   - *binaries and archives* (NUL bytes or stray control characters, or `tar/zip/gz/xz/squashfs/deb/sqlite...`): not stored, hash in the manifest, unless allowed with `--allow`.
+4. **Scan** what is left, binary-safe and fail-closed. Private-key headers, GitHub/Anthropic/AWS/Google/Slack/npm/Tailscale tokens and `psk=` abort with exit 3. Weaker `password=`/`token:` lines only warn.
+5. **Commit** under `backups/orangepi/<date>-<label>/` (`files/` + `MANIFEST.md`) on a new branch created from the repo's default branch **without tracking it**, using a temporary worktree. Files are added with `git add -f` and the staged count is compared with what was pulled (exit 6 on mismatch), so a nested `.gitignore` cannot silently drop files.
+6. **Confirm and push** explicitly to `refs/heads/<branch>`. The question names the origin URL. `--yes` is ignored when credential-like lines were found or binaries were allowed.
+
+Exit codes: 2 validation/usage, 3 secret found or scan error, 4 branch exists, 5 nothing left to commit, 6 integrity mismatch. A branch that did not reach a commit is deleted automatically.
 
 ## Rules
 - Run it only on the Mac. Do not install GitHub tokens on the board.
@@ -41,5 +48,6 @@ Exit codes: 2 usage, 3 secret found, 4 branch exists, 5 nothing to commit.
 ## Restore
 `git fetch origin backup/orangepi-<date>-<label>` then `git checkout` it, and `scp -r backups/orangepi/<date>-<label>/files/<dir> orangepi:~/restore/`. Firmware must come from your own extraction, matched against the hashes in the manifest.
 
-## Tested (local mode, fake source)
-Clean run, size cap, firmware/key/`.ssh` exclusion, strong-secret abort (exit 3), declined confirmation, push to a bare remote leaving the default branch untouched, duplicate label refused (exit 4), `--yes` ignored on credential warning. Not yet run against the real board or over SSH.
+## Tested
+Local mode (`OPI_HOST=local`, fake source, bare local remote), 27 checks, after an independent security review reproduced 3 critical/high leaks in the first version. Covered: blocklist for directories at the path root (`.ssh`, `system-connections`, `rbx3-run`, `gui`), renamed ELF and binary private keys, command injection and spaces in paths, newline file names, nested `.git` and `.gitignore`, missing `origin/HEAD`, branch not tracking the base, nothing-left (exit 5, no orphan branch), duplicate basenames, symlinks, wrong target repo, `--allow` and forced confirmation, firmware never allowed, `psk=` abort, push leaving the default branch untouched.
+Not yet verified: a real SSH run against the board, bash 3.2 and rsync 2.6.9/openrsync on macOS, a scan failure from unreadable files (tests ran as root), `shellcheck`. Do a first real run with `--no-push` and read `MANIFEST.md` before pushing.
