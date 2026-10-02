@@ -20,3 +20,17 @@ Consolidate what runs on the Orange Pi 4 LTS into the RX3-Orange-PI-4-LTS repo, 
 2. Review those names for firmware-derived or secret content.
 3. Once the target repo is private: create a consolidation branch in RX3-Orange-PI-4-LTS from `port/rk3399-ddj400` plus the bundle, without `work/` or firmware.
 4. Add a central config (paths, UIDs, geometry, devices) and a NOTICE with origins; run security-reviewer and `verify.sh`; then push.
+
+## Progress (later on 2026-10-02)
+- Repository RX3-Orange-PI-4-LTS is private (anonymous check returned 404). Imported branch `import/rk3399-ddj400-board` (9 commits + the uncommitted work, commit `6e520a9`).
+- Consolidation branch `consolidate/rk3399-ddj400` (commit `c9fb4ed`): central `config/rx3.conf` with the previous values as defaults, a validating loader `scripts/rb/rx3-config-lib.sh`, the launcher reading from it, `docs/21-central-config.md`, NOTICE with upstream origins. Not yet run on the board.
+- Two independent security reviews of the launcher change (it runs as root): fixed regex injection into `pkill`, config sourced from the environment as root, `stop` failing on a broken local file, unvalidated numeric values, and tests that missed bugs. Final suite: 47 checks as root (37 without), 16 of 16 reintroduced bugs caught.
+- docs/20 corrected: the RGB16 flicker fix is NOT applied (code and running processes use ARGB).
+
+## Still open
+1. Provenance of the 94 `.rgb565` images and the patch byte candidates (generated vs derived from firmware): the user has not answered. Keep the repo private until settled.
+2. Trying the new launcher on the board: run `sh scripts/rb/start-rk3399-ddj400.sh config` first and compare with the live process arguments, run the test as root, then restart the service in a quiet moment.
+3. Remaining hardcoded paths: systemd units (`/home/orangepi/RX3-RK3399-DDJ400`), `usb-watch.sh`, `assemble-rk3399.sh`, `manage-functional-baseline.py`, `deploy-module.sh`, key-stems `module.sh`.
+4. Real-time scheduling for the service as a normal user (rbtv docs/18).
+5. `rbtv` (public fork) still holds `port/rk3399-ddj400`; decide whether to make it private or duplicate it.
+
