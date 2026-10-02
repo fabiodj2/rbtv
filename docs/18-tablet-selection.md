@@ -63,7 +63,8 @@ Source: `docs/sessions/2026-10-02-board-triage.md` (Armbian, kernel 6.18.44 `cur
 
 Reading for the tablet decision: an aarch64 kernel with `COMPAT` on A53/A72 cores is now proven at configuration level on real hardware, which makes RK3399/RK3566-class SoCs credible. It does not prove behaviour (ioctl compat for ALSA/fbdev/evdev under a 32-bit userspace) until `rbp` or a small ARM32 test actually runs.
 
-### Next checks on the board (read-only except the RT sysctl)
+### Next checks on the board
+Automated by `scripts/orangepi/test-arm32-rt.sh` (items 1 and 2 below; add `--sudo` for the privileged half, which restores the sysctl on exit). Report goes to `docs/sessions/<date>-arm32-rt-test.md`. Tested here only under qemu-arm; the verdicts that matter come from the board.
 1. `arm-linux-gnueabi-gcc -static -o hello32 hello.c && ./hello32`, then a dynamic soft-float build against the RX3 glibc 2.13 chroot.
 2. `sudo sysctl kernel.sched_rt_runtime_us=-1`, run a test with `chrt -f 50` and `ulimit -r 99` inside the systemd unit; check `/sys/fs/cgroup` for `cpu.rt_runtime_us` if it is denied.
 3. `evtest /dev/input/event2` to settle touch axes and orientation.
