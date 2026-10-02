@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "ask": [
+      "Bash(sudo:*)",
+      "Bash(dd:*)",
+      "Bash(mkfs*)",
+      "Bash(wipefs:*)",
+      "Bash(mount:*)",
+      "Bash(umount:*)",
+      "Bash(systemctl:*)",
+      "Bash(chroot:*)",
+      "Bash(modprobe:*)",
+      "Bash(rm -rf:*)",
+      "Bash(git push:*)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./keys/**)",
+      "Read(~/.ssh/**)",
+      "Read(**/*.UPD)"
+    ]
+  }
+}
