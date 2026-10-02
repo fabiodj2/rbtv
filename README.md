@@ -37,6 +37,7 @@ Wayland requirement) than to the POCO X3.
 | Playback with a loaded track (audio + scrolling waveform) | ✅ done | [docs/15](docs/15-playback-fix.md) |
 | Audio (HDMI PCM open + engine callback) | 🔶 device/callback done | [docs/08](docs/08-audio.md) |
 | USB stick + rekordbox database (USB1) | ✅ done | [docs/11](docs/11-usb.md) |
+| Tablet selection research (native `rbp`) | 🔶 research, candidates unverified | [docs/18](docs/18-tablet-selection.md) |
 
 ## Hardware
 
