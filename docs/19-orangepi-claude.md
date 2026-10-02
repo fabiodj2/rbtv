@@ -3,13 +3,16 @@
 The Orange Pi 4 (RK3399: Cortex-A72 + A53, aarch64) already has Claude Code and several RX3 builds. Everything in `.claude/` (hooks, rules, agents, skills) is plain files in git, so the board gets the same workflow by cloning this repo and starting `claude` inside it.
 
 ## 1. Setup on the board
+Public repo: fetch the script with `curl` and read it before running. **Private repo**: `raw.githubusercontent.com` and anonymous `git clone` fail, so authenticate first (`gh auth login`, or a read-only fine-grained token) and fetch through `gh`:
 ```sh
-# one-off: fetch the bootstrap (or copy it with scp), then run it
-curl -fsSL https://raw.githubusercontent.com/fabiodj2/rbtv/ccr-a8d86acf-yklgcs/scripts/orangepi/bootstrap-claude.sh -o bootstrap-claude.sh
-less bootstrap-claude.sh            # read it before running
-bash bootstrap-claude.sh
+gh auth login                                   # once; log out when done (see docs/20)
+gh repo clone fabiodj2/rbtv ~/rbtv -- --branch ccr-a8d86acf-yklgcs
+less ~/rbtv/scripts/orangepi/bootstrap-claude.sh    # read before running
+bash ~/rbtv/scripts/orangepi/bootstrap-claude.sh
 cd ~/rbtv && claude
 ```
+(Public alternative: `curl -fsSL https://raw.githubusercontent.com/fabiodj2/rbtv/ccr-a8d86acf-yklgcs/scripts/orangepi/bootstrap-claude.sh -o bootstrap-claude.sh`.)
+
 `bootstrap-claude.sh` clones/updates this repo (branch via `RBTV_BRANCH`), makes read-only shallow copies of the reference repos in `~/ref` (rx3-pi, Rx3-flx4, RX3-Orange-PI-4-LTS, rblive4-vf), marks hooks executable, installs the board permission template and runs `verify.sh`. Needs `git jq gcc bash` (and optionally `shellcheck`).
 
 ## 2. What loads automatically inside `~/rbtv`

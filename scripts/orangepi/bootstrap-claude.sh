@@ -9,6 +9,18 @@ DEST="${RBTV_DIR:-$HOME/rbtv}"
 REF_DIR="${RBTV_REF_DIR:-$HOME/ref}"
 REF_REPOS=(fabiodj2/rx3-pi fabiodj2/Rx3-flx4 fabiodj2/RX3-Orange-PI-4-LTS fabiodj2/rblive4-vf)
 
+# Works for public and private repos: prefer an authenticated gh, else plain git without prompting.
+export GIT_TERMINAL_PROMPT=0
+clone_repo() {  # clone_repo <owner/repo> <dest> [git clone args...]
+  local slug="$1" dest="$2"; shift 2
+  if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
+    gh repo clone "$slug" "$dest" -- "$@"
+  else
+    git clone "$@" "https://github.com/$slug" "$dest" \
+      || { echo "clone of $slug failed (private repo? run 'gh auth login' or use a read-only token)" >&2; return 1; }
+  fi
+}
+
 echo "== bootstrap: repo=$REPO_URL branch=$BRANCH dest=$DEST"
 
 missing=()
@@ -27,14 +39,14 @@ if [ -d "$DEST/.git" ]; then
   git -C "$DEST" checkout "$BRANCH"
   git -C "$DEST" merge --ff-only "origin/$BRANCH"
 else
-  git clone --branch "$BRANCH" "$REPO_URL" "$DEST"
+  clone_repo "${REPO_URL#https://github.com/}" "$DEST" --branch "$BRANCH"
 fi
 
 mkdir -p "$REF_DIR"
 for r in "${REF_REPOS[@]}"; do
   d="$REF_DIR/$(basename "$r")"
   if [ -d "$d/.git" ]; then git -C "$d" pull --ff-only -q || echo "warn: could not update $d"
-  else git clone -q --depth 1 "https://github.com/$r" "$d" || echo "warn: could not clone $r"; fi
+  else clone_repo "$r" "$d" -q --depth 1 || echo "warn: could not clone $r"; fi
 done
 
 chmod +x "$DEST"/.claude/hooks/*.sh "$DEST"/.claude/scripts/*.sh "$DEST"/scripts/orangepi/*.sh
