@@ -16,7 +16,7 @@ Status: **research, partly unverified.** Sources: this repo, the user's other re
 |---|---|---|
 | RK3288 (Cortex-A17, armv7) | **Proven** | Chromebit, Prime GO, SC Live 4 on kernel 6.x |
 | Raspberry Pi 5 (Cortex-A76, aarch64 + compat) | **Proven** | rx3-pi, Rx3-flx4 (daily driver, Touch Display 2, FLX4/DDJ-400) |
-| RK3399 (Orange Pi 4) | Untested | RX3-Orange-PI-4-LTS only compiled |
+| RK3399 (2× A72 + 4× A53, Orange Pi 4 LTS) | **Kernel supports ARM32** (measured, section 7); an ARM32 binary has not been executed yet | board triage 2026-10-02 |
 | Cortex-A53/A55/A72/A73 (RK3566/68, A64/H6/H616) | Plausible, *unverified* | Arm docs say AArch32 is possible; needs kernel compat; one secondary source for RK3568 |
 | RK3588 (A76+A55) | *Unverified* | AArch32 on A76 per Arm; kernel/board support not confirmed |
 | Armv9.2 cores (Cortex-X4/A720/A520: Snapdragon 8 Gen 3, similar) | **Avoid** | 64-bit only (Arm A720 docs, 9to5google, Android Police) |
@@ -48,6 +48,27 @@ lsusb -t; dmesg | grep -i -E 'usb|otg'      # check VBUS and port count
 - `getPcController()` NULL and `getTotalLength()` crashes need `rbp` patches.
 - USB enumeration can take ~17 s (also on the Chromebit); the Pi 5 needs per-port VBUS control.
 
-## 6. Open items
+## 6. Measured on the Orange Pi 4 LTS (board triage 2026-10-02)
+Source: `docs/sessions/2026-10-02-board-triage.md` (Armbian, kernel 6.18.44 `current-rockchip64`, 3.8 GiB RAM, 5.6 GiB free).
+
+| Requirement | Measured | Status |
+|---|---|---|
+| ARM32 execution | `CONFIG_COMPAT=y`, `COMPAT_BINFMT_ELF=y`, no `aarch32_el0` file (all 6 cores A53+A72 run AArch32), `/lib/ld-linux.so.3` present, `arm-linux-gnueabi-gcc` installed | config OK; **no ARM32 binary run yet** |
+| Real-time | `sched_rt_runtime_us=950000`, `ulimit -r 0`, `CONFIG_PREEMPT=y` (not RT), **`CONFIG_RT_GROUP_SCHED=y`** | needs `-1` and `ulimit -r 99`; RT_GROUP_SCHED may still deny SCHED_FIFO inside systemd cgroups (*to verify*) |
+| Display | `/dev/fb0` 1920×1080×32, HDMI-A-1 connected, `DRM_FBDEV_EMULATION=y`, `FB_DEVICE=y` | OK (pillarbox 27/20 in RX3-Orange-PI-4-LTS) |
+| Audio | ES8316 codec, HDMI, DDJ-400 as USB audio (playback only) | OK; shim must pick one |
+| Touch | `wch.cn TouchScreen` on `event2`/`event3` | present; orientation unconfirmed |
+| USB | DDJ-400 on xhci (high speed), stick on EHCI, HID on a hub (OHCI), all at once | OK |
+| Missing | `shellcheck`, static ARM32 test binary | trivial |
+
+Reading for the tablet decision: an aarch64 kernel with `COMPAT` on A53/A72 cores is now proven at configuration level on real hardware, which makes RK3399/RK3566-class SoCs credible. It does not prove behaviour (ioctl compat for ALSA/fbdev/evdev under a 32-bit userspace) until `rbp` or a small ARM32 test actually runs.
+
+### Next checks on the board (read-only except the RT sysctl)
+1. `arm-linux-gnueabi-gcc -static -o hello32 hello.c && ./hello32`, then a dynamic soft-float build against the RX3 glibc 2.13 chroot.
+2. `sudo sysctl kernel.sched_rt_runtime_us=-1`, run a test with `chrt -f 50` and `ulimit -r 99` inside the systemd unit; check `/sys/fs/cgroup` for `cpu.rt_runtime_us` if it is denied.
+3. `evtest /dev/input/event2` to settle touch axes and orientation.
+4. `aplay -D hw:2,0` for a short 44.1 kHz stereo tone through the DDJ-400, then the same through the HDMI card.
+
+## 7. Open items
 - Re-run the candidate research once `wiki.postmarketos.org` and `gitlab.postmarketos.org` are allowed by the environment's network policy, then fill a per-device table (SoC, panel, touch, audio, USB, bootloader, source URL).
-- Decide between path 1 (Pi 5) and path 2 (RK3288 tablet) with the user.
+- Decide between path 1 (Pi 5) and path 2 (RK3288 tablet) with the user. The Orange Pi 4 LTS data (section 6) adds a third proven-by-config path: an RK3399-class board with a touch panel.
