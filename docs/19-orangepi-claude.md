@@ -41,3 +41,6 @@ cd ~/rbtv && claude
 2. Compare the builds you already tested: use `~/ref/*` read-only and ask Claude to produce a diff table (display geometry, audio path, MIDI mapping, launcher) into `docs/sessions/`.
 3. Confirm the open item from RX3-Orange-PI-4-LTS: touch orientation (`touch-bridge.c` assumes no axis inversion) and the 1920×1080 pillarbox, which are not yet validated on hardware.
 4. Port the Chromebit launcher/udev patterns from this repo (docs/14) to the board only after steps 1–3 pass.
+
+## 6. Backups
+Backups of the board go to git from the Mac with `scripts/orangepi/backup-pull.sh`; see [docs/20](20-orangepi-backups.md). Do not push from the board.

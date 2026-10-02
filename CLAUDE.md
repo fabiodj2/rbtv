@@ -19,4 +19,6 @@ rbtv: run the XDJ-RX3 `rbp` player on a Chromebit CS10 (RK3288) with postmarketO
 5. End or compact a long session with `/session-handoff` (what worked, what failed, what is left).
 6. Update the matching `docs/NN-*.md` when behavior changes (`doc-updater`).
 
+Orange Pi backups: only via `scripts/orangepi/backup-pull.sh` on the Mac (docs/20, `rules/backups.md`).
+
 Details: `.claude/rules/*.md`.
