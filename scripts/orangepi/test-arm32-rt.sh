@@ -8,17 +8,25 @@
 #   --sudo  : also (a) sets kernel.sched_rt_runtime_us=-1 temporarily and restores the old value on exit,
 #             (b) runs the test binary as root, (c) runs it as your user in a transient systemd unit with
 #             LimitRTPRIO=99. Each privileged command is printed first; sudo will ask for your password.
-# Env:   RUNNER  command prefix for the binary (testing only, e.g. qemu-arm).
+# Env:   TEST_USER  unprivileged user for the systemd-unit test (default: you; if you run as root, the first
+#                   normal account with uid >= 1000). Run it as that normal user for the cleanest result.
+#        RUNNER     command prefix for the binary (testing only, e.g. qemu-arm).
 set -uo pipefail
 
 USE_SUDO=0
 [ "${1:-}" = "--sudo" ] && { USE_SUDO=1; shift; }
-ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="${1:-$ROOT/docs/sessions/$(date +%F)-arm32-rt-test.md}"
 mkdir -p "$(dirname "$OUT")"
 WORK="$(mktemp -d)"
 RUNNER="${RUNNER:-}"
 OLD_RT=""
+UNIT_USER="${TEST_USER:-$(id -un)}"
+if [ "$(id -u)" -eq 0 ] && [ -z "${TEST_USER:-}" ]; then
+  UNIT_USER="$(getent passwd | awk -F: '$3>=1000 && $3<60000 {print $1; exit}')"
+  UNIT_USER="${UNIT_USER:-root}"
+fi
+AM_ROOT=0; [ "$(id -u)" -eq 0 ] && AM_ROOT=1
 cleanup() {
   if [ -n "$OLD_RT" ]; then sudo sysctl -q -w "kernel.sched_rt_runtime_us=$OLD_RT" >/dev/null 2>&1 && echo "restored kernel.sched_rt_runtime_us=$OLD_RT" >&2; fi
   rm -rf "$WORK"
@@ -86,25 +94,35 @@ run bash -c 'zcat /proc/config.gz 2>/dev/null | grep -E "RT_GROUP_SCHED|PREEMPT_
 run bash -c 'stat -fc %T /sys/fs/cgroup; cat /proc/self/cgroup'
 run bash -c 'find /sys/fs/cgroup -maxdepth 3 -name "cpu.rt_runtime_us" 2>/dev/null | head -5 | while read f; do echo "$f: $(cat $f)"; done; echo done'
 
-RC_ROOT="not run"; RC_UNIT="not run"
+RC_ROOT="not run"; RC_UNIT0="not run"; RC_UNIT1="not run"
+unit_test() {  # run hello32 as $UNIT_USER in a transient systemd unit with LimitRTPRIO=99; sets LAST_RC
+  # shellcheck disable=SC2086
+  run sudo systemd-run --wait --pipe --collect -p "User=$UNIT_USER" -p LimitRTPRIO=99 $RUNNER "/tmp/hello32.$$"
+}
 if [ $USE_SUDO -eq 1 ]; then
   sec "4. Privileged steps (sysctl is restored on exit)"
-  add "Commands: sudo sysctl -w kernel.sched_rt_runtime_us=-1 ; sudo <hello32> ; sudo systemd-run --wait --pipe -p User=$(id -un) -p LimitRTPRIO=99 <hello32>"
+  add "Unit user for the service tests: **$UNIT_USER**$([ "$UNIT_USER" = root ] && echo ' (WARNING: root; the non-root case is NOT tested, set TEST_USER)')"
+  add "Commands: systemd-run (as $UNIT_USER) with the original rt_runtime ; sudo sysctl -w kernel.sched_rt_runtime_us=-1 ; sudo <hello32> ; systemd-run again"
+  HAVE_SD=0; command -v systemd-run >/dev/null && HAVE_SD=1
+  if [ $HAVE_SD -eq 1 ]; then
+    cp "$WORK/hello32" "/tmp/hello32.$$" && chmod 755 "/tmp/hello32.$$"
+    add "4a. Service as $UNIT_USER, LimitRTPRIO=99, **original** sched_rt_runtime_us=$(cat /proc/sys/kernel/sched_rt_runtime_us):"
+    unit_test; RC_UNIT0=$LAST_RC
+  else
+    add "systemd-run not available"; RC_UNIT0="skipped"; RC_UNIT1="skipped"
+  fi
   OLD_RT="$(cat /proc/sys/kernel/sched_rt_runtime_us)"
   echo "setting kernel.sched_rt_runtime_us=-1 (was $OLD_RT; restored on exit)" >&2
+  add "4b. sudo sysctl -w kernel.sched_rt_runtime_us=-1"
   run sudo sysctl -w kernel.sched_rt_runtime_us=-1
   [ $LAST_RC -eq 0 ] || OLD_RT=""
-  add "As root:"
+  add "4c. As root with rt_runtime=-1:"
   # shellcheck disable=SC2086
   run sudo $RUNNER "$WORK/hello32"; RC_ROOT=$LAST_RC
-  if command -v systemd-run >/dev/null; then
-    cp "$WORK/hello32" "/tmp/hello32.$$" && chmod 755 "/tmp/hello32.$$"
-    add "As $(id -un) inside a transient systemd unit with LimitRTPRIO=99 (the deployment case):"
-    # shellcheck disable=SC2086
-    run sudo systemd-run --wait --pipe --collect -p "User=$(id -un)" -p LimitRTPRIO=99 $RUNNER "/tmp/hello32.$$"; RC_UNIT=$LAST_RC
+  if [ $HAVE_SD -eq 1 ]; then
+    add "4d. Service as $UNIT_USER, LimitRTPRIO=99, rt_runtime=-1:"
+    unit_test; RC_UNIT1=$LAST_RC
     rm -f "/tmp/hello32.$$"
-  else
-    add "systemd-run not available"; RC_UNIT="skipped"
   fi
 fi
 
@@ -115,10 +133,16 @@ case "$RC_STATIC" in
   *)   verdict "ARM32 static exec" "FAIL (rc=$RC_STATIC; see section 2)" ;;
 esac
 verdict "ARM32 dynamic exec (host armel libc)" "$([ "$RC_DYN" = 0 ] || [ "$RC_DYN" = 3 ] && echo "PASS (rc=$RC_DYN)" || echo "$RC_DYN")"
-verdict "RT as user (ulimit -r as is)" "$([ "$RC_STATIC" = 0 ] && echo PASS || ([ "$RC_STATIC" = 3 ] && echo "DENIED (expected while ulimit -r is 0)" || echo n/a))"
+if [ "$AM_ROOT" -eq 1 ]; then
+  verdict "RT as the invoking user" "n/a: invoked as root (rc=$RC_STATIC). Root ignores ulimit -r, so a DENIED here would point to the cgroup RT limit (RT_GROUP_SCHED), not RLIMIT_RTPRIO"
+else
+  verdict "RT as user (ulimit -r as is)" "$([ "$RC_STATIC" = 0 ] && echo PASS || ([ "$RC_STATIC" = 3 ] && echo "DENIED (expected while ulimit -r is 0)" || echo n/a))"
+fi
 if [ $USE_SUDO -eq 1 ]; then
   verdict "RT as root, rt_runtime=-1" "$([ "$RC_ROOT" = 0 ] && echo PASS || echo "FAIL (rc=$RC_ROOT)")"
-  verdict "RT in systemd unit (user, RTPRIO=99)" "$([ "$RC_UNIT" = 0 ] && echo PASS || echo "FAIL (rc=$RC_UNIT): check cpu.rt_runtime_us / RT_GROUP_SCHED")"
+  verdict "service as $UNIT_USER, ORIGINAL rt_runtime" "$([ "$RC_UNIT0" = 0 ] && echo "PASS (no sysctl change needed)" || echo "$RC_UNIT0 (non-zero = needs a persistent sysctl/cgroup setting)")"
+  verdict "service as $UNIT_USER, rt_runtime=-1" "$([ "$RC_UNIT1" = 0 ] && echo PASS || echo "$RC_UNIT1 (check cpu.rt_runtime_us / RT_GROUP_SCHED)")"
+  [ "$UNIT_USER" != root ] || verdict "NOTE" "unit user was root: rerun with TEST_USER=<normal user> to test the real deployment case"
 else
   verdict "privileged RT checks" "not run (use --sudo)"
 fi

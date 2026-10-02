@@ -16,7 +16,7 @@ Status: **research, partly unverified.** Sources: this repo, the user's other re
 |---|---|---|
 | RK3288 (Cortex-A17, armv7) | **Proven** | Chromebit, Prime GO, SC Live 4 on kernel 6.x |
 | Raspberry Pi 5 (Cortex-A76, aarch64 + compat) | **Proven** | rx3-pi, Rx3-flx4 (daily driver, Touch Display 2, FLX4/DDJ-400) |
-| RK3399 (2× A72 + 4× A53, Orange Pi 4 LTS) | **Kernel supports ARM32** (measured, section 7); an ARM32 binary has not been executed yet | board triage 2026-10-02 |
+| RK3399 (2× A72 + 4× A53, Orange Pi 4 LTS) | **Proven**: ARM32 soft-float binaries execute and `rbp` runs with DDJ-400, touch, USB and audio (section 6) | board triage + test, 2026-10-02 |
 | Cortex-A53/A55/A72/A73 (RK3566/68, A64/H6/H616) | Plausible, *unverified* | Arm docs say AArch32 is possible; needs kernel compat; one secondary source for RK3568 |
 | RK3588 (A76+A55) | *Unverified* | AArch32 on A76 per Arm; kernel/board support not confirmed |
 | Armv9.2 cores (Cortex-X4/A720/A520: Snapdragon 8 Gen 3, similar) | **Avoid** | 64-bit only (Arm A720 docs, 9to5google, Android Police) |
@@ -62,6 +62,24 @@ Source: `docs/sessions/2026-10-02-board-triage.md` (Armbian, kernel 6.18.44 `cur
 | Missing | `shellcheck`, static ARM32 test binary | trivial |
 
 Reading for the tablet decision: an aarch64 kernel with `COMPAT` on A53/A72 cores is now proven at configuration level on real hardware, which makes RK3399/RK3566-class SoCs credible. It does not prove behaviour (ioctl compat for ALSA/fbdev/evdev under a 32-bit userspace) until `rbp` or a small ARM32 test actually runs.
+
+### Measured: ARM32 + real-time test on the board (2026-10-02)
+Run by the board's Claude session with `scripts/orangepi/test-arm32-rt.sh` (first version), **logged in as root**.
+
+| Check | Result |
+|---|---|
+| Soft-float EABI5 binary, static and dynamic (host armel libc) | **Runs** (`rc=3` means it executed; only SCHED_FIFO was denied) |
+| `SCHED_FIFO` with defaults (`sched_rt_runtime_us=950000`, `ulimit -r 0`) | Denied |
+| `SCHED_FIFO` as root with `sched_rt_runtime_us=-1` | **PASS** |
+| `SCHED_FIFO` in a transient systemd unit with `LimitRTPRIO=99` and `sched_rt_runtime_us=-1` | **PASS** |
+
+What this proves: the RK3399 kernel executes the same kind of binary as `rbp`, and RT works once the global RT runtime is unlimited.
+What it does **not** prove yet:
+- The unit ran as `User=root`, because the session was root. The real case (a normal user in a service) is untested.
+- The unit test ran only **after** setting `-1`, so it is unknown whether the default 950000 is enough. The script restores the sysctl on exit, so a deployment needs the value persisted (for example `/etc/sysctl.d/90-rt.conf`) if the default fails.
+- The denial with defaults happened as root, which ignores `RLIMIT_RTPRIO`; that points to the cgroup RT limit (`RT_GROUP_SCHED`) rather than the ulimit.
+
+`test-arm32-rt.sh` now runs the unit as a normal user (`TEST_USER`, default first uid >= 1000), tests it with the original sysctl first and again with `-1`, and flags root runs. Re-run it as a normal user: `scripts/orangepi/test-arm32-rt.sh --sudo`.
 
 ### Next checks on the board
 Automated by `scripts/orangepi/test-arm32-rt.sh` (items 1 and 2 below; add `--sudo` for the privileged half, which restores the sysctl on exit). Report goes to `docs/sessions/<date>-arm32-rt-test.md`. Tested here only under qemu-arm; the verdicts that matter come from the board.

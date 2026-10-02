@@ -43,7 +43,7 @@ if [ ! -e "$DEST/.claude/settings.local.json" ]; then
   echo "created .claude/settings.local.json from the board template (ask before sudo/dd/mount/systemctl)"
 fi
 
-"$DEST/.claude/scripts/verify.sh" | tail -3 || true
+(cd "$DEST" && .claude/scripts/verify.sh | tail -3) || true
 cat <<MSG
 
 Done. Next:

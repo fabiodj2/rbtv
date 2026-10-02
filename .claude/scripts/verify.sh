@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deterministic "code-based grader" for rbtv (ECC verification-loop, adapted). Exit 1 on any FAIL.
 set -uo pipefail
-cd "$(git rev-parse --show-toplevel)"
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"   # this repo, never the caller's CWD
 fail=0
 ok()   { echo "PASS  $*"; }
 bad()  { echo "FAIL  $*"; fail=1; }

@@ -3,7 +3,8 @@
 # Writes a markdown report; changes nothing on the system. Safe to run as a normal user.
 set -uo pipefail
 
-OUT="${1:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)/docs/sessions/$(date +%F)-board-triage.md}"
+SELF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+OUT="${1:-$SELF_ROOT/docs/sessions/$(date +%F)-board-triage.md}"
 mkdir -p "$(dirname "$OUT")"
 sec() { printf '\n## %s\n\n' "$1"; }
 run() { printf '```\n$ %s\n' "$*"; eval "$*" 2>&1 | head -40; printf '```\n'; }
