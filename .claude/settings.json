@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": ".claude/hooks/session-context.sh" }] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Write|Edit|Bash", "hooks": [{ "type": "command", "command": ".claude/hooks/guard-secrets.sh" }] },
+      { "matcher": "Write", "hooks": [{ "type": "command", "command": ".claude/hooks/warn-stray-md.sh" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Write|Edit", "hooks": [{ "type": "command", "command": ".claude/hooks/check-shell.sh" }] }
+    ],
+    "PreCompact": [
+      { "hooks": [{ "type": "command", "command": ".claude/hooks/precompact.sh" }] }
+    ]
+  }
+}
