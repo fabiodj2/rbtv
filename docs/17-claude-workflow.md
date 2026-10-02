@@ -32,3 +32,9 @@ Language reviewers, TDD/e2e agents, continuous-learning skill, mgrep, LSP/Next.j
   mgrep login
   mgrep watch --dry-run              # check what would be uploaded first
   ```
+
+## Verification loops and evals (added)
+- `.claude/scripts/verify.sh` — deterministic grader: `bash -n`/shellcheck on all scripts, C syntax check, no firmware/keys tracked, hooks valid and executable, markdown links resolve. Cross-compile-only C files give WARN, not FAIL.
+- `/verification-loop` — runs verify.sh, reviews the diff, calls the reviewers, and states what was *not* verified on the device.
+- `/eval-harness` — define capability/regression evals first; use pass^k for must-be-consistent fixes (start-up pop, keyshim crash).
+- `harness-optimizer` agent — audits only `.claude/**` and `CLAUDE.md`; security-relevant changes stay BLOCKED until you approve. ECC's version calls `node scripts/harness-audit.js`, which does not exist here, so it uses verify.sh instead.
