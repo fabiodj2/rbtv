@@ -51,3 +51,10 @@ Exit codes: 2 validation/usage, 3 secret found or scan error, 4 branch exists, 5
 ## Tested
 Local mode (`OPI_HOST=local`, fake source, bare local remote), 27 checks, after an independent security review reproduced 3 critical/high leaks in the first version. Covered: blocklist for directories at the path root (`.ssh`, `system-connections`, `rbx3-run`, `gui`), renamed ELF and binary private keys, command injection and spaces in paths, newline file names, nested `.git` and `.gitignore`, missing `origin/HEAD`, branch not tracking the base, nothing-left (exit 5, no orphan branch), duplicate basenames, symlinks, wrong target repo, `--allow` and forced confirmation, firmware never allowed, `psk=` abort, push leaving the default branch untouched.
 Not yet verified: a real SSH run against the board, bash 3.2 and rsync 2.6.9/openrsync on macOS, a scan failure from unreadable files (tests ran as root), `shellcheck`. Do a first real run with `--no-push` and read `MANIFEST.md` before pushing.
+
+## Backups taken
+| Date | Target branch (RX3-Orange-PI-4-LTS) | Sources | Notes |
+|---|---|---|---|
+| 2026-10-02 | `backup/orangepi-2026-10-02-orangepi4-lts-snapshot-v2` (commit `23708a5`) | `~/rx3-build`, `~/orangepi-rx3.sh`, `~/orangepi-run-test.sh` | 150 files, about 1 MiB, no firmware/credentials found by a name and text scan (not a binary inspection). Made **on the board** (`host alias: local`, paths `/root/...`) with the first, pre-hardening version of the script; later backups must use the current script and the Mac flow. |
+
+Not backed up on purpose: `~/rx3-rootfs` (contains the proprietary `rbp`; keep only hashes, see docs/16), large scan logs, and `~/ref/*` (read-only clones of repos already in git).
