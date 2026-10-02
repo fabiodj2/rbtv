@@ -1,0 +1,16 @@
+# mgrep uploads to a cloud store: exclude everything sensitive or bulky (mirrors .gitignore)
+images/
+work/
+mnt/
+staging/
+extracted/
+keys/
+*.key
+*.pem
+.env*
+*.UPD
+*.upd
+rootfs.cramfs
+*.pdb
+*.img*
+.claude/skills/learned/

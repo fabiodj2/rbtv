@@ -23,3 +23,12 @@ Source: https://github.com/affaan-m/ECC (shortform, longform and security guides
 
 ## Not applied (add on demand)
 Language reviewers, TDD/e2e agents, continuous-learning skill, mgrep, LSP/Next.js/Supabase MCPs — irrelevant here. Install from the ECC repo only after reviewing them as supply-chain code.
+
+## continuous-learning and mgrep (added)
+- **continuous-learning**: ECC marks v1 deprecated in favor of v2 (background observer on every tool call, writes under `~/.claude`). v2 is heavy and off-repo, so a lean v1-style flow is used instead: `Stop` hook `learn-reminder.sh` nudges after 10+ user messages, `/continuous-learning` writes reviewable skills to `.claude/skills/learned/`. Revisit v2 if the volume of learnings justifies it.
+- **mgrep** (https://github.com/mixedbread-ai/mgrep, third-party, not part of ECC): it is a local install, not a repo file. Tip: ECC reports ~2x fewer tokens vs grep. It **uploads repo files to Mixedbread's cloud store**, so it is opt-in: `.mgrepignore` excludes firmware, keys and images, and `.claude/skills/mgrep` only activates if you install it:
+  ```bash
+  npm install -g @mixedbread/mgrep   # or: claude plugin marketplace add https://github.com/mixedbread-ai/mgrep
+  mgrep login
+  mgrep watch --dry-run              # check what would be uploaded first
+  ```
