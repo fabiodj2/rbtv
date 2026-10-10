@@ -14,6 +14,9 @@ LOGDIR="$REPO/work/tests/integrated-live"
 
 HP_GAIN=${RX3_HP_GAIN_X:-4}
 USB_SEG=${USBWATCH_SEG:-/usb}
+# Formato do layer primário do DirectFB. O rbp pede RGB16 (palavra em
+# 0x1a3ab8); ver docs/22-display-hdmi-1080p.md antes de mudar.
+DFB_PIXELFORMAT=${RX3_DFB_PIXELFORMAT:-RGB16}
 
 # Se já formos root (ex: chamado via "sudo $0"), não re-invocar sudo
 # internamente - evita pedir senha de novo a cada chamada.
@@ -228,7 +231,7 @@ nohup $SUDO "$DDJ" \
 echo '=== INICIANDO PLAYER ==='
 
 nohup $SUDO chroot "$RUNTIME" env \
-    DFBARGS='system=fbdev,mode=1280x800,pixelformat=ARGB,primary-only,no-hardware' \
+    DFBARGS="system=fbdev,mode=1280x800,pixelformat=$DFB_PIXELFORMAT,primary-only,no-hardware" \
     DFB_ROTATE=off \
     RX3_TOUCH_BRIDGE=1 \
     RX3_AUDIO_DEVICE='hw:CARD=DDJ400,DEV=0' \

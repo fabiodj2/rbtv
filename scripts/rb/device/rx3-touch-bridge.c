@@ -42,20 +42,32 @@ static void button(int i,int down){
  * (37+(1280-x)*3976/1280, ...) assumed a factory calibration that this
  * runtime never had. */
 static struct report rx3_record(int down,int ux,int uy){return (struct report){down,0,1279-ux,uy};}
+/* rbp's touch consumer wants a CHANGE stream, not a sampled one (rbpi4b
+ * tscfake_emit, measured there): a record identical to the previous one is
+ * not sent, and an up->down transition goes out as two frames so rbp's
+ * debounce sees 0->1->1 instead of discarding a lone first frame. This
+ * bridge used to rewrite the held record every 10 ms and send ten releases;
+ * with that, toggles under the finger (BEAT FX/STATUS, the FX bank, pad
+ * mode) flipped on their own after a tap. */
+static void emit(int out,int down,int ux,int uy){
+ static int last_down=0,last_x=-1,last_y=-1,primed=0;
+ if(primed&&down==last_down&&ux==last_x&&uy==last_y)return;
+ struct report r=rx3_record(down,ux,uy);
+ for(int n=(down&&!last_down)?2:1;n>0;n--)if(write(out,&r,sizeof(r))!=sizeof(r))perror("touch report");
+ last_down=down;last_x=ux;last_y=uy;primed=1;
+}
 static void release_inputs(struct finger *fingers,int out,int native_held,int ux,int uy){
  for(int i=0;i<10;i++)if(fingers[i].active&&fingers[i].region>0&&fingers[i].region<=12)button(fingers[i].region-1,0);
- if(native_held){
-  struct report r=rx3_record(0,ux,uy);
-  for(int i=0;i<10;i++){if(write(out,&r,sizeof(r))!=sizeof(r))perror("touch release");usleep(10000);}
- }
+ if(native_held)emit(out,0,ux,uy);
  memset(fingers,0,10*sizeof(*fingers));
 }
 static void retry_pause(void){for(int i=0;i<20&&running;i++)usleep(50000);}
 int main(int argc,char**argv){
  if(argc<3)return 2;
- int fullscreen=0,exclusive=0,swap_xy=0,invert_x=0,invert_y=0;
+ int fullscreen=0,pillarbox=0,exclusive=0,swap_xy=0,invert_x=0,invert_y=0;
  for(int i=3;i<argc;i++){
   if(!strcmp(argv[i],"--fullscreen"))fullscreen=1;
+  else if(!strcmp(argv[i],"--pillarbox"))pillarbox=1;
   else if(!strcmp(argv[i],"--exclusive"))exclusive=1;
   else if(!strcmp(argv[i],"--swap-xy"))swap_xy=1;
   else if(!strcmp(argv[i],"--invert-x"))invert_x=1;
@@ -116,17 +128,21 @@ int main(int argc,char**argv){
    if(f->region>=20&&ready){int si=f->region-20;float a=(265-(ly-(si%3)*293))/180.f;if(a<0)a=0;if(a>1)a=1;state->level[si]=a;command(slider_keys[si],4,slider_channels[si],0,a);}
    else if(f->region>0&&f->region<=12&&buttons[f->region-1].scroll&&now>=f->next_repeat){button(f->region-1,1);f->next_repeat=now+120;}
    else if(f->region==0){
-   /* Fullscreen inverse of frame-scale.h's 27/20 pillarbox scale (was
-    * 3/2 for the portrait rotate+scale): subtract the 96px bar offset
-    * first, then invert. Debug/non-fullscreen inverse of the 11/10
-    * preview scale (was 4/5): subtract the 256px preview offset first. */
-   ux=fullscreen?(lx-96)*20/27:(lx-256)*10/11;
+   /* Fullscreen: inverse of what is actually on the panel. The live
+    * DirectFB fbdev driver (directfb-chromebit.patch) STRETCHES 1280x800
+    * to the whole 1920x1080 (x*3/2, y*27/20): measured on fb0 2026-10-10,
+    * no bars. --pillarbox is the inverse of frame-scale.h's 27/20 fit with
+    * 96px bars (the DRM fb-present path, or a driver with an aspect-fit
+    * present). Using the pillarbox inverse on the stretched picture put
+    * taps up to ~70 logical px off at the left/right edges.
+    * Non-fullscreen: inverse of the 11/10 preview scale, 256px offset. */
+   ux=!fullscreen?(lx-256)*10/11:pillarbox?(lx-96)*20/27:lx*1280/1920;
    uy=fullscreen?ly*20/27:ly*10/11;
    if(ux<0)ux=0;if(ux>1279)ux=1279;if(uy<0)uy=0;if(uy>799)uy=799;}
   }
   if(f->active&&!f->down){if(f->region>0&&f->region<=12)button(f->region-1,0);if(source==i){source=-1;release=10;}f->active=0;}
  }
- if(source>=0||release){struct report r=rx3_record(source>=0,ux,uy);if(write(out,&r,sizeof(r))!=sizeof(r))perror("touch report");if(source<0)release--;}
+ if(source>=0||release){emit(out,source>=0,ux,uy);release=0;}
  }
  release_inputs(fingers,out,source>=0||release,ux,uy);
  if(!replay)close(in);
