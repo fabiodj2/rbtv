@@ -34,10 +34,18 @@ static void button(int i,int down){
  * ends up rotated or mirrored on the real screen, swap x<->y and/or
  * flip the "ax.maximum-...-x" subtraction below; see
  * DISPLAY-PORT-NOTES.md. */
+/* The six-byte record carries rbp's logical 1280x800 coordinates, with x
+ * reflected: rbp acts at 1279-x of whatever x it reads. This pairs with the
+ * identity TouchCalib_*.dat (0 0 320 200 1280 800) the launcher installs.
+ * Contract measured on the same v1.20 rbp by github.com/fabiodj2/rbpi4b,
+ * docs/07-touch.md ("rbp reflects x"). The old raw-ADC style values
+ * (37+(1280-x)*3976/1280, ...) assumed a factory calibration that this
+ * runtime never had. */
+static struct report rx3_record(int down,int ux,int uy){return (struct report){down,0,1279-ux,uy};}
 static void release_inputs(struct finger *fingers,int out,int native_held,int ux,int uy){
  for(int i=0;i<10;i++)if(fingers[i].active&&fingers[i].region>0&&fingers[i].region<=12)button(fingers[i].region-1,0);
  if(native_held){
-  struct report r={0,0,37+(1280-ux)*3976/1280,72+uy*3856/800};
+  struct report r=rx3_record(0,ux,uy);
   for(int i=0;i<10;i++){if(write(out,&r,sizeof(r))!=sizeof(r))perror("touch release");usleep(10000);}
  }
  memset(fingers,0,10*sizeof(*fingers));
@@ -69,6 +77,10 @@ int main(int argc,char**argv){
  if(exclusive&&!replay&&ioctl(in,EVIOCGRAB,1)){if(!waiting)perror("exclusive touch input");waiting=1;close(in);retry_pause();continue;}
  waiting=0;fprintf(stderr,"touch input connected: %s\n",argv[1]);
  struct finger fingers[10]={0};int slot=0,source=-1,ux=0,uy=0,release=0;int dropped=0;struct input_event e;struct pollfd p={in,POLLIN,0};
+ /* The kernel drops an ABS event equal to the value it already holds, so a
+  * first touch on the panel's last position carries no position at all. Seed
+  * from the device's stored values (rbpi4b docs/07, seed_abs_position). */
+ if(!replay)for(int i=0;i<10;i++){fingers[i].x=ax.value;fingers[i].y=ay.value;}
  while(running){
  int ready=poll(&p,1,10);if(ready<0){if(errno==EINTR)continue;perror("touch poll");break;}
  if(ready){
@@ -114,7 +126,7 @@ int main(int argc,char**argv){
   }
   if(f->active&&!f->down){if(f->region>0&&f->region<=12)button(f->region-1,0);if(source==i){source=-1;release=10;}f->active=0;}
  }
- if(source>=0||release){struct report r={source>=0,0,37+(1280-ux)*3976/1280,72+uy*3856/800};if(write(out,&r,sizeof(r))!=sizeof(r))perror("touch report");if(source<0)release--;}
+ if(source>=0||release){struct report r=rx3_record(source>=0,ux,uy);if(write(out,&r,sizeof(r))!=sizeof(r))perror("touch report");if(source<0)release--;}
  }
  release_inputs(fingers,out,source>=0||release,ux,uy);
  if(!replay)close(in);

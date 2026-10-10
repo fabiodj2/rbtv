@@ -15,6 +15,14 @@ LOGDIR="$REPO/work/tests/integrated-live"
 HP_GAIN=${RX3_HP_GAIN_X:-4}
 USB_SEG=${USBWATCH_SEG:-/usb}
 
+# Se já formos root (ex: chamado via "sudo $0"), não re-invocar sudo
+# internamente - evita pedir senha de novo a cada chamada.
+if [ "$(id -u)" -eq 0 ]; then
+    SUDO=''
+else
+    SUDO='sudo'
+fi
+
 status()
 {
     echo '=== PROCESSOS ==='
@@ -35,7 +43,7 @@ status()
         tail -20 || true
 
     echo '=== USB ==='
-    sudo env \
+    $SUDO env \
         RX3_RUNTIME="$RUNTIME" \
         USBWATCH_SEG="$USB_SEG" \
         sh "$WATCHER" status 2>/dev/null || true
@@ -43,20 +51,20 @@ status()
 
 stop_all()
 {
-    sudo env RX3_RUNTIME="$RUNTIME" \
+    $SUDO env RX3_RUNTIME="$RUNTIME" \
         USBWATCH_SEG="$USB_SEG" \
         sh "$WATCHER" stop 2>/dev/null || true
 
-    sudo pkill -TERM -f \
+    $SUDO pkill -TERM -f \
         '^/lib/ld-linux\.so\.3 /root/pdj/rbp -a$' 2>/dev/null || true
 
-    sudo pkill -TERM -f \
+    $SUDO pkill -TERM -f \
         '^/lib/ld-linux\.so\.3 /usr/bin/edb_streamd$' 2>/dev/null || true
 
-    sudo pkill -TERM -f \
+    $SUDO pkill -TERM -f \
         'work/build/host/ddj400-bridge' 2>/dev/null || true
 
-    sudo pkill -TERM -f \
+    $SUDO pkill -TERM -f \
         'work/build/host/rx3-touch-bridge' 2>/dev/null || true
 
     sleep 2
@@ -64,11 +72,11 @@ stop_all()
     echo '=== RESTAURANDO CONSOLE VIRTUAL ==='
 
     if [ -w /sys/class/vtconsole/vtcon1/bind ]; then
-        echo 1 | sudo tee             /sys/class/vtconsole/vtcon1/bind >/dev/null || true
+        echo 1 | $SUDO tee             /sys/class/vtconsole/vtcon1/bind >/dev/null || true
     fi
 
     if command -v chvt >/dev/null 2>&1; then
-        sudo chvt 1 >/dev/null 2>&1 || true
+        $SUDO chvt 1 >/dev/null 2>&1 || true
     fi
 }
 
@@ -85,21 +93,25 @@ case "${1:-start}" in
         ;;
     restart)
         ;;
+    run)
+        # Como start, mas bloqueia até o rbp sair (para Type=simple no
+        # systemd; ver scripts/rb/systemd/rx3-rk3399-ddj400.service).
+        ;;
     *)
-        echo "Uso: $0 start|stop|restart|status" >&2
+        echo "Uso: $0 start|stop|restart|status|run" >&2
         exit 2
         ;;
 esac
 
 mkdir -p "$LOGDIR"
-sudo -v
+[ -z "$SUDO" ] || sudo -v
 
 echo '=== ENCERRANDO INSTÂNCIAS ANTERIORES ==='
 stop_all
 
 echo '=== PREPARANDO RUNTIME E MONTAGENS ==='
 
-sudo mkdir -p \
+$SUDO mkdir -p \
     "$RUNTIME/proc" \
     "$RUNTIME/sys" \
     "$RUNTIME/dev/snd" \
@@ -108,24 +120,24 @@ sudo mkdir -p \
     "$RUNTIME/tmp" \
     "$RUNTIME/media/usb1/sda1"
 
-sudo mountpoint -q "$RUNTIME/proc" ||
-    sudo mount --bind /proc "$RUNTIME/proc"
+$SUDO mountpoint -q "$RUNTIME/proc" ||
+    $SUDO mount --bind /proc "$RUNTIME/proc"
 
-sudo mountpoint -q "$RUNTIME/sys" ||
-    sudo mount --bind /sys "$RUNTIME/sys"
+$SUDO mountpoint -q "$RUNTIME/sys" ||
+    $SUDO mount --bind /sys "$RUNTIME/sys"
 
-sudo mountpoint -q "$RUNTIME/dev/shm" ||
-    sudo mount --bind /dev/shm "$RUNTIME/dev/shm"
+$SUDO mountpoint -q "$RUNTIME/dev/shm" ||
+    $SUDO mount --bind /dev/shm "$RUNTIME/dev/shm"
 
-sudo mountpoint -q "$RUNTIME/dev/snd" ||
-    sudo mount --bind /dev/snd "$RUNTIME/dev/snd"
+$SUDO mountpoint -q "$RUNTIME/dev/snd" ||
+    $SUDO mount --bind /dev/snd "$RUNTIME/dev/snd"
 
 if [ ! -e "$RUNTIME/dev/fb0" ]; then
-    sudo mknod "$RUNTIME/dev/fb0" c 29 0
+    $SUDO mknod "$RUNTIME/dev/fb0" c 29 0
 fi
 
-sudo mountpoint -q "$RUNTIME/dev/fb0" ||
-    sudo mount --bind /dev/fb0 "$RUNTIME/dev/fb0"
+$SUDO mountpoint -q "$RUNTIME/dev/fb0" ||
+    $SUDO mount --bind /dev/fb0 "$RUNTIME/dev/fb0"
 
 echo '=== PREPARANDO FIFOS ==='
 
@@ -134,11 +146,32 @@ for FIFO in \
     "$RUNTIME/dev/tsc2007_2-0048" \
     "$RUNTIME/dev/rx3-control"
 do
-    sudo rm -f "$FIFO"
-    sudo mkfifo -m 0666 "$FIFO"
+    $SUDO rm -f "$FIFO"
+    $SUDO mkfifo -m 0666 "$FIFO"
 done
 
-sudo rm -f \
+echo '=== CALIBRAÇÃO DO TOQUE (IDENTIDADE) ==='
+
+# rx3-touch-bridge escreve coordenadas lógicas 1280x800 (x espelhado), e isso
+# só vale com calibração identidade. Sem estes arquivos o rbp fica com fatores
+# indefinidos. Contrato medido pelo rbpi4b (docs/21-rbpi4b-comparison.md).
+CALIB_DIR="$RUNTIME/root/settings"
+CALIB_IDENTITY='0
+0
+320
+200
+1280
+800'
+$SUDO mkdir -p "$CALIB_DIR"
+for CALIB in TouchCalib_Factory.dat TouchCalib_User.dat; do
+    if [ "$($SUDO cat "$CALIB_DIR/$CALIB" 2>/dev/null)" != "$CALIB_IDENTITY" ]; then
+        [ ! -e "$CALIB_DIR/$CALIB" ] ||
+            $SUDO cp -f "$CALIB_DIR/$CALIB" "$CALIB_DIR/$CALIB.bak"
+        printf '%s\n' "$CALIB_IDENTITY" | $SUDO tee "$CALIB_DIR/$CALIB" >/dev/null
+    fi
+done
+
+$SUDO rm -f \
     "$RUNTIME/tmp/req_LocalDBServer" \
     "$RUNTIME/tmp/guard_LocalDBServer" \
     "$RUNTIME/tmp/audioshim.log" \
@@ -157,28 +190,28 @@ echo "USB:   $USB_SEG"
 echo "Ganho do fone: ${HP_GAIN}x"
 
 if [ -w /sys/class/vtconsole/vtcon1/bind ]; then
-    echo 0 | sudo tee \
+    echo 0 | $SUDO tee \
         /sys/class/vtconsole/vtcon1/bind >/dev/null || true
 fi
 
 echo '=== DESABILITANDO LOG DIRECTFB DE ALTA FREQUÊNCIA ==='
 
-sudo rm -f "$RUNTIME/tmp/dfbdig9.log"
-sudo ln -s /dev/null "$RUNTIME/tmp/dfbdig9.log"
+$SUDO rm -f "$RUNTIME/tmp/dfbdig9.log"
+$SUDO ln -s /dev/null "$RUNTIME/tmp/dfbdig9.log"
 
 # fbshim32 registrava cada ioctl e crescia aproximadamente 6 GB por dia.
-sudo rm -f "$RUNTIME/tmp/fbshim32.log"
-sudo ln -s /dev/null "$RUNTIME/tmp/fbshim32.log"
+$SUDO rm -f "$RUNTIME/tmp/fbshim32.log"
+$SUDO ln -s /dev/null "$RUNTIME/tmp/fbshim32.log"
 
 echo '=== INICIANDO EDB_STREAMD ==='
 
-nohup sudo chroot "$RUNTIME" \
+nohup $SUDO chroot "$RUNTIME" \
     /lib/ld-linux.so.3 /usr/bin/edb_streamd \
     >"$LOGDIR/edb-streamd.log" 2>&1 </dev/null &
 
 echo '=== INICIANDO TOUCH ==='
 
-nohup sudo env RX3_RUNTIME="$RUNTIME" \
+nohup $SUDO env RX3_RUNTIME="$RUNTIME" \
     "$TOUCH" \
     "$TOUCH_DEVICE" \
     "$RUNTIME/dev/tsc2007_2-0048" \
@@ -187,14 +220,14 @@ nohup sudo env RX3_RUNTIME="$RUNTIME" \
 
 echo '=== INICIANDO DDJ-400 ==='
 
-nohup sudo "$DDJ" \
+nohup $SUDO "$DDJ" \
     -v \
     -f "$RUNTIME/tmp/rb-ctrl.fifo" \
     >"$LOGDIR/ddj400-bridge.log" 2>&1 </dev/null &
 
 echo '=== INICIANDO PLAYER ==='
 
-nohup sudo chroot "$RUNTIME" env \
+nohup $SUDO chroot "$RUNTIME" env \
     DFBARGS='system=fbdev,mode=1280x800,pixelformat=ARGB,primary-only,no-hardware' \
     DFB_ROTATE=off \
     RX3_TOUCH_BRIDGE=1 \
@@ -205,15 +238,28 @@ nohup sudo chroot "$RUNTIME" env \
     LD_PRELOAD=/root/pdj/librx3_core.so:/usr/lib/memshim.so:/usr/lib/fbshim.so:/usr/lib/audioshim.so:/usr/lib/keyshim.so:/usr/lib/netshim.so \
     /lib/ld-linux.so.3 /root/pdj/rbp -a \
     >"$LOGDIR/rbp.log" 2>&1 </dev/null &
+RBP_PID=$!
 
 sleep 8
 
 echo '=== INICIANDO USB WATCHER ==='
 
-sudo env \
+$SUDO env \
     RX3_RUNTIME="$RUNTIME" \
     USBWATCH_SEG="$USB_SEG" \
     sh "$WATCHER" start
 
 sleep 10
 status
+
+if [ "${1:-start}" = run ]; then
+    # O systemd vê o tempo de vida do rbp como o da unidade: se o rbp morrer,
+    # Restart=always sobe tudo de novo. SIGTERM (systemctl stop) limpa antes.
+    trap 'stop_all; exit 0' TERM INT
+    while kill -0 "$RBP_PID" 2>/dev/null; do
+        sleep 2
+    done
+    echo '=== RBP SAIU; ENCERRANDO O RESTO ==='
+    stop_all
+    exit 1
+fi

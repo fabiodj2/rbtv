@@ -1,25 +1,37 @@
 [Unit]
 Description=RX3 RK3399 DDJ-400 runtime
-Documentation=file:/home/orangepi/RX3-RK3399-DDJ400/docs/19-rk3399-key-stems-functional.md
-Wants=network-online.target
-After=local-fs.target sound.target network-online.target
-StartLimitIntervalSec=120
-StartLimitBurst=5
+Documentation=file:/home/orangepi/RX3-RK3399-DDJ400/docs/21-rbpi4b-comparison.md
+# Lessons taken from github.com/fabiodj2/rbpi4b scripts/device/rblive4.service:
+# - no network-online wait and no fixed sleep: rbp needs fb0, /dev, /proc and
+#   the DDJ-400; media arrives asynchronously through usb-watch.sh.
+# - Type=simple over a launcher that blocks on rbp (`run`), so a dead rbp is a
+#   dead unit and Restart=always brings it back. The old oneshot +
+#   RemainAfterExit stayed "active" with nothing running.
+# - getty@tty1 owns the console on fb0; Conflicts= hands the screen over and
+#   `systemctl start getty@tty1` takes it back.
+After=local-fs.target sound.target systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+Conflicts=getty@tty1.service
+# StartLimit* belong in [Unit] (systemd >= 230); 0 = retry forever.
+StartLimitIntervalSec=0
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=simple
 User=root
 Group=root
 Environment=HOME=/home/orangepi
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 WorkingDirectory=/home/orangepi/RX3-RK3399-DDJ400
-ExecStartPre=/bin/sleep 8
-ExecStart=/bin/sh /home/orangepi/RX3-RK3399-DDJ400/scripts/rb/start-rk3399-ddj400.sh start
-ExecStop=/bin/sh /home/orangepi/RX3-RK3399-DDJ400/scripts/rb/start-rk3399-ddj400.sh stop
-TimeoutStartSec=90
-TimeoutStopSec=30
-Restart=on-failure
+ExecStart=/bin/sh /home/orangepi/RX3-RK3399-DDJ400/scripts/rb/start-rk3399-ddj400.sh run
+Restart=always
 RestartSec=10
+TimeoutStopSec=30
+# SIGTERM to the launcher alone, so its trap runs stop_all; SIGKILL for the
+# rest of the group only after TimeoutStopSec.
+KillMode=mixed
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rx3-rk3399
 
 [Install]
 WantedBy=multi-user.target
