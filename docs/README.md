@@ -21,6 +21,7 @@ Start here:
 | [14-handover](14-handover.md) | Session handover: deployed artefacts/hashes, restore commands, input, playback fix |
 | [15-playback-fix](15-playback-fix.md) | Why PLAY did nothing: the rb2go `getTotalLength` workaround, and the FIFO/daemon restart gotcha |
 | [16-handoff](16-handoff.md) | **Session handoff**: deployed hashes, rebuild/deploy, open audio-pop fix, latent `keyshim`/`UiMain` crash |
+| [17-shim-safety](17-shim-safety.md) | Shim safety rules from the AZ-MODS audit (hash-guarded patches, no cross-thread pointers, bounded logs, kill-switch) |
 
 Related, external to this folder:
 
