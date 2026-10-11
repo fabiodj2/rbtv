@@ -52,7 +52,7 @@ not as proof about any specific build.
 10. **Automatic kill-switch.** Keep a path that disables all patches/shims
     (flag file, env var, or boot-loop counter) and falls back to stock `rbp`.
 
-## Status checklist (to audit against this repo)
+## Status checklist (audited — see [18-shim-audit](18-shim-audit.md))
 
 - [ ] Patch-site byte verification in `scripts/rb` build/deploy
 - [ ] `keyshim` → FIFO path: confirm no stored `IKeyManager` pointer across
