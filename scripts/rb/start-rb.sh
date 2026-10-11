@@ -16,6 +16,34 @@ CH=/home/user/rbx3-run
 PRELOAD=${PRELOAD:-/usr/lib/memshim.so:/usr/lib/fbshim.so:/usr/lib/audioshim.so:/usr/lib/keyshim.so}
 LOGDIR=/home/user/rbx3-run/tmp
 
+# Safe mode / kill-switch (docs/17 rule 10, docs/18 K11).
+# keyshim is the only shim that writes into the engine's memory, so it is the
+# one that gets dropped (memshim/fbshim/audioshim are needed for rbp to run at
+# all).  Triggers:
+#   * /etc/rbtv/disable-keyshim or /etc/rbtv/disable-shims exists on the host
+#   * the last 3 starts that had keyshim loaded died within 40 s
+# Re-enable: rm /etc/rbtv/disable-* ; echo 0 > /home/user/.rbtv-start-failures
+RBTV_STATE=/home/user/.rbtv-start-failures
+FAILS=$(cat "$RBTV_STATE" 2>/dev/null || echo 0)
+case "$FAILS" in ''|*[!0-9]*) FAILS=0 ;; esac
+SAFE=0
+if [ -e /etc/rbtv/disable-keyshim ] || [ -e /etc/rbtv/disable-shims ]; then
+    SAFE=1; REASON="flag file in /etc/rbtv"
+elif [ "$FAILS" -ge 3 ]; then
+    SAFE=1; REASON="$FAILS consecutive early exits"
+fi
+# mirror the host flag into the chroot, where keyshim itself looks for it
+mkdir -p "$CH/etc/rbtv" 2>/dev/null
+if [ -e /etc/rbtv/disable-keyshim ] || [ -e /etc/rbtv/disable-shims ]; then
+    : > "$CH/etc/rbtv/disable-keyshim"
+else
+    rm -f "$CH/etc/rbtv/disable-keyshim"
+fi
+if [ "$SAFE" = 1 ]; then
+    PRELOAD=$(echo "$PRELOAD" | sed 's#:/usr/lib/keyshim.so##')
+    echo "SAFE MODE: keyshim disabled ($REASON); player starts without input injection"
+fi
+
 # 1. device binds + RX3 stubs
 sh /home/user/fix-dev.sh || exit 1
 
@@ -81,6 +109,17 @@ mkdir -p "$CH/media/usb1/sda1"
 if [ -x /home/user/usb-watch.sh ]; then
     sh /home/user/usb-watch.sh start
 fi
+
+# Early-exit detector: if rbp is gone 40 s after launch, count a failure (only
+# while keyshim was loaded, so the safe-mode run itself cannot reset the count).
+(
+    sleep 40
+    if pgrep -f '[r]bp -a' >/dev/null 2>&1; then
+        [ "$SAFE" = 1 ] || echo 0 > "$RBTV_STATE"
+    else
+        echo $((FAILS + 1)) > "$RBTV_STATE"
+    fi
+) >/dev/null 2>&1 &
 
 echo "launched rbp; log: $LOGDIR/rbp.log"
 echo "usb stick hotplug watcher: /home/user/usbwatch.log"

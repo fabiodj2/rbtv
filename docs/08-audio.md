@@ -148,6 +148,15 @@ after startup. `audioshim.so` holds every output channel at zero for
 `STARTUP_FADE_MS` (default 300 ms). `STARTUP_MUTE_MS=0` disables it.
 `/tmp/audioshim.log` logs `startup mute active` / `startup mute released`.
 
+## 7b. Robustness (docs/18)
+
+* The audio path never does file I/O: log lines go through a bounded ring to a
+  low-priority thread; `/tmp/audioshim.log` is capped at 256 KiB (+ `.1`).
+* `writei` loops over partial writes, recovers from xruns, and if the HDMI sink
+  stops accepting data it counts dropped frames and sleeps one period so the
+  engine's playhead stays paced (look for `HDMI sink not accepting audio`).
+* `AUDIOSHIM_DUMP=1` logs the raw sample layout (sign extension check).
+
 ## 8. Files
 
 ```

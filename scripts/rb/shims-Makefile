@@ -46,7 +46,7 @@ knobshim2.so: knobshim2.c
 # audioshim must bind dlopen/dlsym to libdl GLIBC_2.4 (the .symver directives
 # are in the source); link the RX3 libdl explicitly.
 audioshim.so: audioshim.c
-	$(CC) $(CFLAGS) -shared -o $@ $< $(RX3LIB)/libdl.so.2 -lc $(LDFLAGS)
+	$(CC) $(CFLAGS) -shared -o $@ $< $(RX3LIB)/libdl.so.2 -lpthread -lc $(LDFLAGS)
 
 # fbshim16-phone: the Chromebit fb ioctl shim.  Zero-dependency (raw svc), built
 # -nostdlib so the RX3 glibc-2.13 loader accepts it; deployed as usr/lib/fbshim.so.
@@ -56,7 +56,7 @@ fbshim16.so: fbshim16-phone.c
 
 # keyshim: FIFO -> IKeyManager::sendKey, starts the UiMain pump, applies the
 # mixer defaults.  Ported from rb2go (same rbp binary -> same addresses).
-keyshim.so: keyshim.c
+keyshim.so: keyshim.c rbtv_common.h
 	$(CC) $(CFLAGS) -shared -o $@ $< -lpthread -lc $(LDFLAGS)
 
 fbshim-tsc.so: fbshim-tsc.c

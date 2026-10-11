@@ -31,6 +31,7 @@ cp "$REPO/scripts/rb/shims-Makefile" "$WORK/Makefile"
 cp "$REPO/scripts/rb/audioshim.c"    "$WORK/audioshim.c"
 cp "$REPO/scripts/rb/memshim.c"      "$WORK/memshim.c"
 cp "$REPO/scripts/rb/keyshim.c"      "$WORK/keyshim.c"
+cp "$REPO/scripts/rb/rbtv_common.h"  "$WORK/rbtv_common.h"
 cp "$REPO/scripts/rb/fbshim16-phone.c" "$WORK/fbshim16-phone.c"
 
 # The RX3 runtime rootfs has no libc_nonshared.a / libpthread_nonshared.a

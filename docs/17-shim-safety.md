@@ -54,10 +54,10 @@ not as proof about any specific build.
 
 ## Status checklist (audited — see [18-shim-audit](18-shim-audit.md))
 
-- [ ] Patch-site byte verification in `scripts/rb` build/deploy
+- [x] Runtime verification of the rbp image before keyshim touches it (md5, docs/18 K1); patch-site byte checks already exist in `patch-rbp-crashguards.py`
 - [ ] `keyshim` → FIFO path: confirm no stored `IKeyManager` pointer across
       threads (see latent `keyshim`/`UiMain` crash in [16-handoff](16-handoff.md))
-- [ ] `audioshim`: no logging/I/O in the ALSA callback; fix the open pop
-- [ ] Log size caps / rotation for `rb.service` and the MIDI bridge
+- [x] `audioshim`: no logging/I/O in the ALSA callback (docs/18 A1); [ ] open pop still open
+- [x] audioshim log capped/rotated; [ ] keyshim, `rb.service` and the MIDI bridge logs still unbounded
 - [ ] Verify nothing runs with real-time priority except audio, deliberately
-- [ ] Implement and test the automatic disable path
+- [x] Automatic disable path: `KEYSHIM_DISABLE`, `/etc/rbtv/disable-*`, 3-strike safe mode in `start-rb.sh` (docs/18 K11)

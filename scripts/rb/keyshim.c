@@ -14,6 +14,16 @@
  * The control FIFO is what a real MIDI controller bridge (ddj400-bridge.c)
  * feeds.  While such a bridge is active the periodic re-application of the
  * synthetic mixer defaults is disabled, so physical faders are not fought over.
+ *
+ * Safety (docs/17, docs/18):
+ *   K1  every address above is only valid for ONE rbp build.  Before any thread
+ *       touches engine memory the shim identifies the player (exact basename
+ *       "rbp" in argv) and compares the md5 of its image with RBP_EXPECTED_MD5.
+ *       Any mismatch => the shim stays completely inert (no writes, no calls).
+ *   K2  UiMain's openDevice() is not idempotent: it is called at most once per
+ *       "pump not running" episode, under a lock, with a retry back-off.
+ *   K11 kill-switch: KEYSHIM_DISABLE=1, /etc/rbtv/disable-keyshim or
+ *       /etc/rbtv/disable-shims (checked inside the chroot).
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -28,6 +38,8 @@
 #include <time.h>
 #include <sys/syscall.h>
 
+#include "rbtv_common.h"
+
 static int real_open(const char *p, int flags)
 {
     return syscall(SYS_openat, AT_FDCWD, p, flags, 0);
@@ -35,10 +47,6 @@ static int real_open(const char *p, int flags)
 static ssize_t real_read(int fd, void *buf, size_t n)
 {
     return syscall(SYS_read, fd, buf, n);
-}
-static int real_close(int fd)
-{
-    return syscall(SYS_close, fd);
 }
 
 /* ---- tiny logger (raw syscalls, no printf) ---- */
@@ -78,20 +86,48 @@ static void klog_dec(const char *label, int v)
     klog_str(buf);
 }
 
-/* ---- rbp process check ---- */
-static int is_rbp_process(void)
+/* ---- K1/K11: is this the exact rbp this shim was written for? ----
+ * RBP_EXPECTED_MD5 is rbp-chromebit (docs/14 §2).  KEYSHIM_RBP_MD5=<32 hex>
+ * overrides it when deliberately porting to another build (the addresses below
+ * must then be re-checked by hand). */
+#define RBP_EXPECTED_MD5 "18a64bc4d0ffd1cbd35f3a6ea447fca8"
+
+static pthread_once_t verify_once = PTHREAD_ONCE_INIT;
+static volatile int shim_ok = 0;   /* written once inside verify_once */
+
+static void do_verify(void)
 {
-    char cmd[128];
-    int fd, n;
-    fd = real_open("/proc/self/cmdline", O_RDONLY);
-    if (fd < 0) return 0;
-    n = (int)real_read(fd, cmd, sizeof(cmd) - 1);
-    real_close(fd);
-    if (n <= 0) return 0;
-    cmd[n] = '\0';
-    for (int i = 0; i < n; i++)
-        if (cmd[i] == '\0') cmd[i] = ' ';
-    return strstr(cmd, "rbp") != NULL;
+    char path[256], got[33], msg[200];
+    const char *want = getenv("KEYSHIM_RBP_MD5");
+
+    if (!want || strlen(want) != 32)
+        want = RBP_EXPECTED_MD5;
+    if (!rbtv_find_rbp_path(path, sizeof(path)))
+        return;                                  /* not the player: stay silent */
+    if (rbtv_shim_disabled("keyshim", "KEYSHIM_DISABLE")) {
+        klog_str("keyshim: DISABLED by kill-switch (env/flag file); inert\n");
+        return;
+    }
+    if (rbtv_md5_file(path, got) < 0) {
+        klog_str("keyshim: cannot hash the rbp image; inert\n");
+        return;
+    }
+    if (strcmp(got, want) != 0) {
+        snprintf(msg, sizeof(msg),
+                 "keyshim: REFUSING to run: rbp md5 %s, expected %s; inert\n",
+                 got, want);
+        klog_str(msg);
+        return;
+    }
+    snprintf(msg, sizeof(msg), "keyshim: rbp image verified (md5 %s)\n", got);
+    klog_str(msg);
+    shim_ok = 1;
+}
+
+static int shim_enabled(void)
+{
+    pthread_once(&verify_once, do_verify);
+    return shim_ok;
 }
 
 /* ---- KeyManager injection ---- */
@@ -104,15 +140,11 @@ static int is_rbp_process(void)
 #define OP_ROTATE  4
 #define OP_VALUE   5
 
-static int rbp_checked = -1;
-
 static void *get_key_manager(void)
 {
     void **p;
     void *mgr;
-    if (rbp_checked < 0)
-        rbp_checked = is_rbp_process();
-    if (!rbp_checked)
+    if (!shim_enabled())
         return NULL;
     p = (void **)UI_OBJ_MGR_GLOBAL;
     if (!p) return NULL;
@@ -124,32 +156,43 @@ static void *get_key_manager(void)
 typedef void (*sendkey_fn)(void *km, int keycode, int op, int ch,
                            long param, float f, long l);
 
+/* Both injector threads (buttons, controller) and mixer_defaults() go through
+ * here; serialise them so sendKey() is never entered concurrently from the
+ * shim (the engine's own UI thread is outside our control). */
+static pthread_mutex_t inject_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int send_locked(int keycode, int op, int ch, long param, float f, long l,
+                       int verbose)
+{
+    void *km, **vt;
+    sendkey_fn fn;
+    int ok = 0;
+
+    pthread_mutex_lock(&inject_lock);
+    km = get_key_manager();
+    if (!km) {
+        if (verbose) klog_str("send_rx_key: no key manager\n");
+    } else if (!(vt = *(void ***)km)) {
+        if (verbose) klog_str("send_rx_key: vtable null\n");
+    } else if (!(fn = (sendkey_fn)vt[SENDKEY_VTABLE_WORD])) {
+        if (verbose) klog_str("send_rx_key: vtable fn null\n");
+    } else {
+        fn(km, keycode, op, ch, param, f, l);
+        ok = 1;
+    }
+    pthread_mutex_unlock(&inject_lock);
+    return ok;
+}
+
 static void send_rx_key(int keycode, int op, int ch)
 {
-    void *km = get_key_manager();
-    if (!km) {
-        klog_str("send_rx_key: no key manager\n");
-        return;
-    }
-    void **vt = *(void ***)km;
-    sendkey_fn fn = (sendkey_fn)vt[SENDKEY_VTABLE_WORD];
-    if (!fn) {
-        klog_str("send_rx_key: vtable fn null\n");
-        return;
-    }
     klog_hex("sendkey key=", (unsigned)keycode);
-    fn(km, keycode, op, ch, 0, 0.0f, 0);
+    send_locked(keycode, op, ch, 0, 0.0f, 0, 1);
 }
 
 static void send_rx_key_fl(int keycode, int op, int ch, long param, float f, long l)
 {
-    void *km = get_key_manager();
-    if (!km)
-        return;
-    void **vt = *(void ***)km;
-    sendkey_fn fn = (sendkey_fn)vt[SENDKEY_VTABLE_WORD];
-    if (fn)
-        fn(km, keycode, op, ch, param, f, l);
+    send_locked(keycode, op, ch, param, f, l, 0);
 }
 
 /* Mixer input routing (djengine::MixerRouteMngr) @ 0x01149f50/0x01149f54.
@@ -166,6 +209,7 @@ static void send_rx_key_fl(int keycode, int op, int ch, long param, float f, lon
 
 static void mixer_route(void)
 {
+    if (!shim_ok) return;
     *(volatile unsigned int *)MIX_ROUTE_CH1 = MIX_ROUTE_PLAYER0;
     *(volatile unsigned int *)MIX_ROUTE_CH2 = MIX_ROUTE_PLAYER1;
 }
@@ -198,47 +242,96 @@ static void mixer_defaults(void)
  * path never runs, so no UiMain thread exists and every injected key sits in
  * the queue forever (IKeyManager::onKey is never reached).  Start it here.
  */
+#ifndef PANEL_PEER_INSTANCE_GLOBAL
 #define PANEL_PEER_INSTANCE_GLOBAL 0x26870b0UL  /* ui::PanelComPeerLinux::instance */
+#endif
 #define PANEL_PEER_NUM_DEVICES_OFF 0x94         /* +0x94 = nDevices */
 #define JUCE_THREAD_OFF            4            /* juce::Thread subobject at +4 */
+#ifndef FN_THREAD_IS_RUNNING
 #define FN_THREAD_IS_RUNNING       0x3b6360UL   /* juce::Thread::isThreadRunning() const */
+#endif
+#ifndef FN_THREAD_START
 #define FN_THREAD_START            0x3b6674UL   /* juce::Thread::startThread(int) */
+#endif
+#ifndef FN_OPEN_DEVICE
 #define FN_OPEN_DEVICE             0x366804UL   /* ui::PanelComPeerLinux::openDevice(int) */
+#endif
 
 static int ui_pump_running(void)
 {
-    void *inst = *(void **)PANEL_PEER_INSTANCE_GLOBAL;
+    void *inst;
+    if (!shim_ok)
+        return 0;
+    inst = *(void **)PANEL_PEER_INSTANCE_GLOBAL;
     if (!inst)
         return 0;
     return ((int (*)(void *))FN_THREAD_IS_RUNNING)((char *)inst + JUCE_THREAD_OFF);
 }
 
+/* K2: PanelComPeerLinux::openDevice() is NOT idempotent - a second call on an
+ * initialised instance re-runs the epoll/device setup and UiMain then faults at
+ * NULL+0x10 (docs/16 §5).  So:
+ *   - one attempt per "pump not running" episode (pump_opened_at != 0),
+ *   - serialised by pump_lock (both injector threads call this),
+ *   - a retry only after PUMP_RETRY_S, never in a tight loop. */
+#define PUMP_RETRY_S 5
+static pthread_mutex_t pump_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile time_t pump_opened_at = 0;
+
 static int ui_pump_ensure(void)
 {
     void *inst;
-    int n;
-    if (ui_pump_running())
-        return 1;
-    inst = *(void **)PANEL_PEER_INSTANCE_GLOBAL;
-    if (!inst)
+    int n, i, ok;
+    time_t now;
+
+    if (!shim_ok)
         return 0;
+    if (ui_pump_running()) {
+        pump_opened_at = 0;
+        return 1;
+    }
+
+    pthread_mutex_lock(&pump_lock);
+    if (ui_pump_running()) {                 /* the other thread won */
+        pump_opened_at = 0;
+        pthread_mutex_unlock(&pump_lock);
+        return 1;
+    }
+    inst = *(void **)PANEL_PEER_INSTANCE_GLOBAL;
+    if (!inst) {
+        pthread_mutex_unlock(&pump_lock);
+        return 0;
+    }
     n = *(int *)((char *)inst + PANEL_PEER_NUM_DEVICES_OFF);
-    if (n <= 0)
-        return 0;   /* run() returns immediately while nDevices <= 0 */
+    if (n <= 0) {                            /* run() returns while nDevices <= 0 */
+        pthread_mutex_unlock(&pump_lock);
+        return 0;
+    }
+    now = time(0);
+    if (pump_opened_at && now - pump_opened_at < PUMP_RETRY_S) {
+        pthread_mutex_unlock(&pump_lock);    /* attempt in flight / backing off */
+        return 0;
+    }
+    pump_opened_at = now;
 
     klog_str("keyshim: UiMain pump not running -> openDevice(0)\n");
     ((int (*)(void *, int))FN_OPEN_DEVICE)(inst, 0);
+    for (i = 0; i < 10 && !ui_pump_running(); i++)   /* the thread starts async */
+        usleep(100000);
 
     if (!ui_pump_running()) {
         klog_str("keyshim: openDevice did not start it -> startThread\n");
         ((void (*)(void *, int))FN_THREAD_START)((char *)inst + JUCE_THREAD_OFF, 5);
+        for (i = 0; i < 10 && !ui_pump_running(); i++)
+            usleep(100000);
     }
-    if (ui_pump_running()) {
-        klog_str("keyshim: UiMain pump started\n");
-        return 1;
-    }
-    klog_str("keyshim: UiMain pump FAILED to start\n");
-    return 0;
+    ok = ui_pump_running();
+    klog_str(ok ? "keyshim: UiMain pump started\n"
+                : "keyshim: UiMain pump FAILED to start (retry in 5 s)\n");
+    if (ok)
+        pump_opened_at = 0;
+    pthread_mutex_unlock(&pump_lock);
+    return ok;
 }
 
 /* ---- clear the stale "USB Error / Remove Device" browse caution ----
@@ -251,6 +344,8 @@ static int ui_pump_ensure(void)
 static void clear_browse_caution(void)
 {
     volatile unsigned int *p = (volatile unsigned int *)BROWSE_CAUTION_ID;
+    if (!shim_ok)
+        return;
     if (*p != 0)
         *p = 0;
 }
@@ -290,6 +385,8 @@ static void *key_thread(void *arg)
     int fd = -1;
     (void)arg;
 
+    if (!shim_enabled())
+        return NULL;                          /* K1/K11: stay inert */
     klog_str("keyshim: thread started\n");
 
     for (int i = 0; i < 300; i++) {
@@ -308,8 +405,11 @@ static void *key_thread(void *arg)
 
     /* Wait for the panel devices to be registered, then make sure the UiMain
      * message-pump thread exists (it is what dispatches posted keys). */
-    for (int i = 0; i < 150 && !ui_pump_running(); i++)
-        ui_pump_ensure();
+    for (int i = 0; i < 150; i++) {
+        if (ui_pump_ensure())
+            break;
+        usleep(100000);                       /* never spin on openDevice() */
+    }
 
     /* Unmute the mixer: faders default to 0 on the phone (no subucom).  Send
      * after the pump exists so the messages are actually dispatched. */
@@ -390,6 +490,8 @@ static void *ctrl_thread(void *arg)
     int fd = -1;
     (void)arg;
 
+    if (!shim_enabled())
+        return NULL;                          /* K1/K11: stay inert */
     klog_str("keyshim: ctrl thread started\n");
 
     for (int i = 0; i < 300; i++) {
@@ -402,8 +504,11 @@ static void *ctrl_thread(void *arg)
         return NULL;
     }
 
-    for (int i = 0; i < 150 && !ui_pump_running(); i++)
-        ui_pump_ensure();
+    for (int i = 0; i < 150; i++) {
+        if (ui_pump_ensure())
+            break;
+        usleep(100000);                       /* never spin on openDevice() */
+    }
 
     for (int i = 0; i < 100; i++) {
         fd = real_open(CTRL_FIFO, O_RDWR | O_NONBLOCK);
@@ -454,6 +559,15 @@ __attribute__((constructor))
 static void keyshim_init(void)
 {
     pthread_t tid;
+    char path[256];
+
+    /* Cheap pre-checks only (no hashing, no logging here): do nothing in
+     * processes that are not the player (children of system() inherit
+     * LD_PRELOAD) or when the kill-switch is set. */
+    if (!rbtv_find_rbp_path(path, sizeof(path)))
+        return;
+    if (rbtv_shim_disabled("keyshim", "KEYSHIM_DISABLE"))
+        return;
     if (pthread_create(&tid, NULL, key_thread, NULL) == 0)
         pthread_detach(tid);
     if (pthread_create(&tid, NULL, ctrl_thread, NULL) == 0)

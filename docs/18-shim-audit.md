@@ -110,10 +110,42 @@ compat.
 6. **Unchanged hazards:** K1 matters more, not less, if you ever mix `rbp`
    builds between boards.
 
-## 6. Suggested order of work
+## 6. Implementation status
 
-1. K1 + K11 (verification and kill-switch) — everything else depends on them.
-2. K2 (apply docs/16 §5) and A4 verification (5-minute sample dump).
-3. A1–A3 (audio-thread hygiene, locking, honest `writei` return values).
+Implemented (host-tested, **not yet run on a board** — the shims are
+cross-built soft-float, no ARM toolchain was available in this session):
+
+| Item | Where | How it is checked |
+|---|---|---|
+| K1 | `keyshim.c`, `rbtv_common.h` | md5 of the rbp image (found from argv, since `/proc/self/exe` is the loader) must equal `18a64bc4…` (override `KEYSHIM_RBP_MD5`); otherwise no thread touches engine memory. Cheap pre-check in the constructor: non-player processes do nothing. Also `vt==NULL` is now tested. |
+| K2 | `keyshim.c` | `openDevice(0)` once per episode under `pump_lock`, 5 s retry back-off, sleeps in the wait loops; `sendKey` calls serialised by `inject_lock`. Test: 4 threads × 2000 calls ⇒ exactly 1 `openDevice`. |
+| K11 | `keyshim.c`, `start-rb.sh` | `KEYSHIM_DISABLE=1`, `/etc/rbtv/disable-keyshim|disable-shims`. `start-rb.sh` mirrors the host flag into the chroot, and after **3 consecutive starts that die within 40 s** it relaunches without keyshim (safe mode). Reset: `rm /etc/rbtv/disable-*; echo 0 > /home/user/.rbtv-start-failures`. audioshim has no kill-switch: rbp cannot open the RX3 cards without it. |
+| A1 | `audioshim.c` | `alog()` formats locally and try-locks a 128-line ring; a SCHED_OTHER logger thread writes the file, caps it at 256 KiB (one `.1` generation), `O_NOFOLLOW`. Never blocks the audio thread; overflow is counted ("log dropped N"). |
+| A2 | `audioshim.c` | `pthread_once` init; `g_state_lock` for the real PCM/open counter; reference-counted real PCM (`snd_pcm_close` drops, waits ≤500 ms for the writer, otherwise leaks rather than frees); `g_mix_lock` around the shared mix buffer and HP flags. Prototypes of the sched/affinity stubs now match glibc. |
+| A3 | `audioshim.c` | `hw_write_all()`: loops on partial writes, `snd_pcm_recover()` on xrun/suspend, ~2 s stall limit; if the sink is unusable it counts dropped frames, logs (rate-limited) and **sleeps one period** so the engine stays paced. |
+
+Not touched (still open from §2–3): K3–K10, A4–A12. `AUDIOSHIM_DUMP=1` was
+added to settle **A4**: it logs, for the first 3 non-silent master buffers, how
+many 32-bit words have top byte `00` / `FF` / other and how many look like
+negative 24-bit values **without** sign extension — run it once with music and
+read `/tmp/audioshim.log`.
+
+Behaviour changes to be aware of: keyshim now refuses to start with any rbp
+other than `rbp-chromebit` (set `KEYSHIM_RBP_MD5` when you deliberately use
+another build); the `keyshim.so`/`audioshim.so` hashes in docs/14 and docs/16 are
+stale until the shims are rebuilt and redeployed; `rbtv_common.h` must sit next
+to `keyshim.c` (`build-shims.sh` copies it) and `audioshim.so` now links
+`-lpthread`.
+
+Tests: `sh scripts/rb/tests/run-host-tests.sh` (x86-64 host; fake libasound,
+mocked PanelComPeerLinux).  On the device afterwards check
+`/tmp/keyshim.log` for `rbp image verified`, and
+`/tmp/audioshim.log` for the usual negotiation lines.
+
+## 7. Suggested order of work
+
+1. ~~K1, K2, K11, A1–A3~~ done (§6); deploy and verify on a board.
+2. A4 verification (`AUDIOSHIM_DUMP=1`), then A5/A6.
+3. K3–K4, K8–K10.
 4. K5/K6/K7, A11 (bounded logs, validated records, safer paths).
 5. §5 items 1–2 on the real board; then display/USB.

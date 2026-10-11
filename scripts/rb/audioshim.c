@@ -10,7 +10,24 @@
 #include <stdarg.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <pthread.h>
+#include <sched.h>
 
+/* Safety notes (docs/17, docs/18):
+ *   A1  nothing in the audio path does file I/O: log lines go through a bounded
+ *       in-memory ring (trylock, drop on contention) drained by a low-priority
+ *       logger thread that also caps the log size.
+ *   A2  shared state is lock-protected; the real PCM is reference-counted so
+ *       snd_pcm_close() cannot free it under a writer; one-time init is
+ *       pthread_once.
+ *   A3  snd_pcm_writei() loops over partial writes, recovers from xruns, and
+ *       when the sink is unusable it still PACES the engine (sleeps the
+ *       period) and counts the dropped frames instead of returning instantly.
+ */
+
+#ifdef __arm__
 /* Enforce GLIBC_2.4 versioning for libdl on glibc 2.13 */
 __asm__(".symver dlsym, dlsym@GLIBC_2.4");
 __asm__(".symver dlopen, dlopen@GLIBC_2.4");
@@ -20,12 +37,14 @@ __asm__(".symver dlclose, dlclose@GLIBC_2.4");
 #ifndef SYS_mmap2
 #define SYS_mmap2 __NR_mmap2
 #endif
+#endif /* __arm__ */
 
 /* rbp's user_space_rtc_init() calls mmap(MAP_SHARED, fd=-1) after /dev/mem open
  * fails (we chmod 000 /dev/mem). That mmap returns MAP_FAILED and leaves a
  * dangling RTC pointer (0x10000023) which later causes SIGSEGV loops -> watchdog.
  * Redirect that broken combination to an anonymous private mapping so it succeeds
  * with zeroed memory and sched_clock/v2_get_cycles read 0 instead of crashing. */
+#ifdef __arm__
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 {
     if (fd < 0 && (flags & MAP_SHARED) && !(flags & MAP_ANONYMOUS)) {
@@ -36,21 +55,111 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
     return (void *)syscall(SYS_mmap2, addr, length, prot, flags, fd,
                            (unsigned long)offset >> 12);
 }
+#endif
 
-#define LOG_PATH "/tmp/audioshim.log"
+#define LOG_PATH       "/tmp/audioshim.log"
+#ifndef LOG_CAP_BYTES
+#define LOG_CAP_BYTES  (256 * 1024)   /* rotate to LOG_PATH.1 beyond this */
+#endif
+#define LOG_SLOTS      128
+#define LOG_LINE       192
 
+static char g_log_ring[LOG_SLOTS][LOG_LINE];
+static int g_log_head, g_log_count;
+static unsigned long g_log_dropped;
+static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t g_log_once = PTHREAD_ONCE_INIT;
+
+static void log_flush_lines(int *fd, long *size, const char *buf, size_t len)
+{
+    ssize_t w;
+    if (*fd < 0) {
+        *fd = open(LOG_PATH, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0644);
+        if (*fd < 0) return;
+        *size = (long)lseek(*fd, 0, SEEK_END);
+    }
+    w = write(*fd, buf, len);
+    if (w > 0) *size += w;
+    if (*size > LOG_CAP_BYTES) {          /* size cap: keep one old generation */
+        close(*fd);
+        *fd = -1;
+        rename(LOG_PATH, LOG_PATH ".1");
+        *size = 0;
+    }
+}
+
+static void *log_thread(void *arg)
+{
+    static char out[LOG_SLOTS * LOG_LINE + 64];   /* only this thread uses it */
+    struct sched_param sp;
+    int fd = -1;
+    long size = 0;
+    (void)arg;
+
+    /* never inherit a real-time class from whichever thread logged first */
+    memset(&sp, 0, sizeof(sp));
+    (void)syscall(SYS_sched_setscheduler, 0, 0 /* SCHED_OTHER */, &sp);
+    (void)setpriority(PRIO_PROCESS, 0, 10);
+
+    for (;;) {
+        size_t len = 0;
+        unsigned long dropped;
+        int i;
+
+        usleep(200000);
+        pthread_mutex_lock(&g_log_lock);
+        for (i = 0; i < g_log_count; i++) {
+            const char *l = g_log_ring[(g_log_head + i) % LOG_SLOTS];
+            size_t n = strlen(l);
+            memcpy(out + len, l, n);
+            len += n;
+        }
+        g_log_head = (g_log_head + g_log_count) % LOG_SLOTS;
+        g_log_count = 0;
+        dropped = g_log_dropped;
+        g_log_dropped = 0;
+        pthread_mutex_unlock(&g_log_lock);
+
+        if (dropped) {
+            len += (size_t)snprintf(out + len, 64, "audioshim: log dropped %lu line(s)\n", dropped);
+        }
+        if (len)
+            log_flush_lines(&fd, &size, out, len);
+    }
+    return NULL;
+}
+
+static void log_start(void)
+{
+    pthread_t t;
+    if (pthread_create(&t, NULL, log_thread, NULL) == 0)
+        pthread_detach(t);
+}
+
+/* Safe from any thread, including the audio callback: formats into a local
+ * buffer, then try-locks the ring; if the logger holds it or the ring is full
+ * the line is dropped (and counted).  Never blocks, never touches a file. */
 static void alog(const char *fmt, ...)
 {
-    char buf[512];
+    char buf[LOG_LINE];
     va_list ap;
+
+    pthread_once(&g_log_once, log_start);
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    int fd = open(LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0666);
-    if (fd >= 0) {
-        write(fd, buf, strlen(buf));
-        close(fd);
+
+    if (pthread_mutex_trylock(&g_log_lock) != 0) {
+        g_log_dropped++;                       /* racy counter: diagnostics only */
+        return;
     }
+    if (g_log_count < LOG_SLOTS) {
+        memcpy(g_log_ring[(g_log_head + g_log_count) % LOG_SLOTS], buf, sizeof(buf));
+        g_log_count++;
+    } else {
+        g_log_dropped++;
+    }
+    pthread_mutex_unlock(&g_log_lock);
 }
 
 /* Opaque ALSA types */
@@ -93,6 +202,8 @@ static int (*real_snd_pcm_sw_params_set_start_threshold)(snd_pcm_t *, snd_pcm_sw
 static int (*real_snd_pcm_sw_params_set_stop_threshold)(snd_pcm_t *, snd_pcm_sw_params_t *, snd_pcm_uframes_t) = NULL;
 static int (*real_snd_pcm_sw_params)(snd_pcm_t *, snd_pcm_sw_params_t *) = NULL;
 static int (*real_snd_pcm_prepare)(snd_pcm_t *) = NULL;
+static int (*real_snd_pcm_recover)(snd_pcm_t *, int, int) = NULL;
+static int (*real_snd_pcm_drop)(snd_pcm_t *) = NULL;
 static snd_pcm_sframes_t (*real_snd_pcm_writei)(snd_pcm_t *, const void *, snd_pcm_uframes_t) = NULL;
 /* Control interface types */
 typedef void snd_ctl_t;
@@ -101,12 +212,10 @@ typedef void snd_pcm_info_t;
 static int (*real_snd_ctl_open)(snd_ctl_t **, const char *, int) = NULL;
 static int (*real_snd_ctl_close)(snd_ctl_t *) = NULL;
 
-static void init_real_alsa(void)
-{
-    static int initialized = 0;
-    if (initialized) return;
-    initialized = 1;
+static pthread_once_t g_alsa_once = PTHREAD_ONCE_INIT;
 
+static void init_real_alsa_once(void)
+{
     void *lib = dlopen("libasound.so.2", RTLD_LAZY | RTLD_GLOBAL);
     if (!lib) {
         alog("audioshim: failed to dlopen libasound.so.2: %s\n", dlerror());
@@ -131,12 +240,31 @@ static void init_real_alsa(void)
     real_snd_pcm_sw_params_set_stop_threshold = dlsym(lib, "snd_pcm_sw_params_set_stop_threshold");
     real_snd_pcm_sw_params = dlsym(lib, "snd_pcm_sw_params");
     real_snd_pcm_prepare = dlsym(lib, "snd_pcm_prepare");
+    real_snd_pcm_recover = dlsym(lib, "snd_pcm_recover");
+    real_snd_pcm_drop = dlsym(lib, "snd_pcm_drop");
     real_snd_pcm_writei = dlsym(lib, "snd_pcm_writei");
     real_snd_ctl_open = dlsym(lib, "snd_ctl_open");
     real_snd_ctl_close = dlsym(lib, "snd_ctl_close");
 
     alog("audioshim: real ALSA initialized\n");
 }
+
+/* pthread_once: every pointer above is filled before any caller proceeds */
+static void init_real_alsa(void)
+{
+    pthread_once(&g_alsa_once, init_real_alsa_once);
+}
+
+/* ---- shared state --------------------------------------------------------
+ * g_state_lock : g_real_playback, g_playback_open_count, g_real_refs
+ * g_mix_lock   : g_mix4ch, g_peak_hp, g_has_hp_audio (headphone thread writes,
+ *                master thread reads - they may be the same thread or not)
+ * Everything else below is touched only by the master writei caller. */
+static pthread_mutex_t g_state_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_mix_lock   = PTHREAD_MUTEX_INITIALIZER;
+static int g_real_refs = 0;
+static int32_t g_peak_hp = 0;
+static int g_has_hp_audio = 0;
 
 /* 4-channel audio buffer for Prime GO (S24_LE: 4 bytes per sample, 4 channels = 16 bytes/frame) */
 #define MAX_FRAMES 4096
@@ -180,9 +308,33 @@ static float startup_gain(unsigned long long t, unsigned long long mute,
     return 1.0f;
 }
 
-static inline int is_real(snd_pcm_t *pcm)
+static int is_real(snd_pcm_t *pcm)
 {
-    return (pcm && pcm == g_real_playback);
+    int r;
+    if (!pcm) return 0;
+    pthread_mutex_lock(&g_state_lock);
+    r = (pcm == g_real_playback);
+    pthread_mutex_unlock(&g_state_lock);
+    return r;
+}
+
+/* Reference-counted access to the real PCM for the streaming path:
+ * snd_pcm_close() waits for the count to drop before freeing the handle. */
+static snd_pcm_t *real_acquire(void)
+{
+    snd_pcm_t *p;
+    pthread_mutex_lock(&g_state_lock);
+    p = g_real_playback;
+    if (p) g_real_refs++;
+    pthread_mutex_unlock(&g_state_lock);
+    return p;
+}
+
+static void real_release(void)
+{
+    pthread_mutex_lock(&g_state_lock);
+    g_real_refs--;
+    pthread_mutex_unlock(&g_state_lock);
 }
 
 /* Resolve the HDMI codec card by *name* instead of a fixed index.  Card
@@ -226,7 +378,10 @@ int snd_pcm_open(snd_pcm_t **pcm, const char *name, int stream, int mode)
     alog("audioshim: snd_pcm_open(name='%s', stream=%d, mode=%d)\n", name ? name : "null", stream, mode);
 
     if (stream == SND_PCM_STREAM_PLAYBACK) {
-        if (g_playback_open_count == 0) {
+        int idx;
+        pthread_mutex_lock(&g_state_lock);
+        idx = g_playback_open_count;
+        if (idx == 0) {
             /* Output 0: Master -> Real HDMI (resolved by card name, see above) */
             if (!g_real_playback && real_snd_pcm_open) {
                 int real_mode = mode & ~2; /* mask out SND_PCM_NONBLOCK so hardware paces audio clock */
@@ -240,29 +395,26 @@ int snd_pcm_open(snd_pcm_t **pcm, const char *name, int stream, int mode)
                 if (err < 0) {
                     err = real_snd_pcm_open(&g_real_playback, "default", SND_PCM_STREAM_PLAYBACK, real_mode);
                     alog("audioshim: fallback open 'default' res=%d handle=%p\n", err, g_real_playback);
+                    if (err < 0)
+                        g_real_playback = NULL;
                 }
             }
             *pcm = g_real_playback;
-            g_playback_open_count++;
-            return 0;
-        } else if (g_playback_open_count == 1) {
+        } else if (idx == 1) {
             /* Output 1: Headphone -> Virtual handle */
             alog("audioshim: mapped virtual Headphone device\n");
             *pcm = (snd_pcm_t *)&g_h_hp;
-            g_playback_open_count++;
-            return 0;
-        } else if (g_playback_open_count == 2) {
+        } else if (idx == 2) {
             /* Output 2: Booth -> Virtual handle */
             alog("audioshim: mapped virtual Booth device\n");
             *pcm = (snd_pcm_t *)&g_h_booth;
-            g_playback_open_count++;
-            return 0;
         } else {
-            alog("audioshim: mapped dummy output device %d\n", g_playback_open_count);
+            alog("audioshim: mapped dummy output device %d\n", idx);
             *pcm = (snd_pcm_t *)&g_h_dummy;
-            g_playback_open_count++;
-            return 0;
         }
+        g_playback_open_count++;
+        pthread_mutex_unlock(&g_state_lock);
+        return 0;
     } else {
         /* Capture / Mic -> Always virtual handle to prevent hardware contention */
         alog("audioshim: mapped virtual Capture device\n");
@@ -273,16 +425,38 @@ int snd_pcm_open(snd_pcm_t **pcm, const char *name, int stream, int mode)
 
 int snd_pcm_close(snd_pcm_t *pcm)
 {
+    snd_pcm_t *p = NULL;
+    int i, refs;
+
     init_real_alsa();
     alog("audioshim: snd_pcm_close(handle=%p)\n", pcm);
 
-    if (is_real(pcm)) {
-        if (g_real_playback && real_snd_pcm_close) {
-            real_snd_pcm_close(g_real_playback);
-            g_real_playback = NULL;
-        }
+    pthread_mutex_lock(&g_state_lock);
+    if (pcm && pcm == g_real_playback) {
+        p = g_real_playback;
+        g_real_playback = NULL;        /* new real_acquire() callers get NULL */
         g_playback_open_count = 0;
     }
+    pthread_mutex_unlock(&g_state_lock);
+    if (!p)
+        return 0;
+
+    /* unblock a writer stuck in a blocking write, then wait for it to leave */
+    if (real_snd_pcm_drop)
+        real_snd_pcm_drop(p);
+    for (i = 0; i < 500; i++) {
+        pthread_mutex_lock(&g_state_lock);
+        refs = g_real_refs;
+        pthread_mutex_unlock(&g_state_lock);
+        if (refs <= 0) break;
+        usleep(1000);
+    }
+    if (i == 500) {
+        alog("audioshim: close: writer still active after 500 ms, leaking the handle\n");
+        return 0;
+    }
+    if (real_snd_pcm_close)
+        real_snd_pcm_close(p);
     return 0;
 }
 
@@ -290,7 +464,7 @@ int snd_pcm_hw_params_any(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
 {
     init_real_alsa();
     if (is_real(pcm) && real_snd_pcm_hw_params_any)
-        return real_snd_pcm_hw_params_any(g_real_playback, params);
+        return real_snd_pcm_hw_params_any(pcm, params);
     return 0;
 }
 
@@ -299,7 +473,7 @@ int snd_pcm_hw_params_set_access(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, in
     init_real_alsa();
     alog("audioshim: set_access req=%d\n", access);
     if (is_real(pcm) && real_snd_pcm_hw_params_set_access)
-        return real_snd_pcm_hw_params_set_access(g_real_playback, params, access);
+        return real_snd_pcm_hw_params_set_access(pcm, params, access);
     return 0;
 }
 
@@ -309,7 +483,7 @@ int snd_pcm_hw_params_set_format(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, in
     alog("audioshim: set_format req=%d\n", format);
     /* Chromebit HDMI hw:0,0 is stereo and natively supports S24_LE (format 6) */
     if (is_real(pcm) && real_snd_pcm_hw_params_set_format) {
-        int err = real_snd_pcm_hw_params_set_format(g_real_playback, params, SND_PCM_FORMAT_S24_LE);
+        int err = real_snd_pcm_hw_params_set_format(pcm, params, SND_PCM_FORMAT_S24_LE);
         alog("audioshim: real set_format(S24_LE=6) res=%d\n", err);
         return err;
     }
@@ -321,7 +495,7 @@ int snd_pcm_hw_params_set_channels(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, 
     init_real_alsa();
     alog("audioshim: set_channels req=%u -> setting 2ch on hw\n", val);
     if (is_real(pcm) && real_snd_pcm_hw_params_set_channels) {
-        int err = real_snd_pcm_hw_params_set_channels(g_real_playback, params, 2);
+        int err = real_snd_pcm_hw_params_set_channels(pcm, params, 2);
         alog("audioshim: real set_channels(2) res=%d\n", err);
         return err;
     }
@@ -334,7 +508,7 @@ int snd_pcm_hw_params_set_rate_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params,
     alog("audioshim: set_rate_near req=%u\n", val ? *val : 0);
     if (is_real(pcm) && real_snd_pcm_hw_params_set_rate_near) {
         if (val) *val = 44100;
-        int err = real_snd_pcm_hw_params_set_rate_near(g_real_playback, params, val, dir);
+        int err = real_snd_pcm_hw_params_set_rate_near(pcm, params, val, dir);
         alog("audioshim: real set_rate_near res=%d rate=%u\n", err, val ? *val : 0);
         return err;
     }
@@ -347,7 +521,7 @@ int snd_pcm_hw_params_set_period_size_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *
     init_real_alsa();
     alog("audioshim: set_period_size_near req=%lu\n", val ? *val : 0);
     if (is_real(pcm) && real_snd_pcm_hw_params_set_period_size_near) {
-        int err = real_snd_pcm_hw_params_set_period_size_near(g_real_playback, params, val, dir);
+        int err = real_snd_pcm_hw_params_set_period_size_near(pcm, params, val, dir);
         alog("audioshim: real set_period_size_near res=%d period=%lu\n", err, val ? *val : 0);
         return err;
     }
@@ -359,7 +533,7 @@ int snd_pcm_hw_params_set_periods_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *para
     init_real_alsa();
     alog("audioshim: set_periods_near req=%u\n", val ? *val : 0);
     if (is_real(pcm) && real_snd_pcm_hw_params_set_periods_near) {
-        int err = real_snd_pcm_hw_params_set_periods_near(g_real_playback, params, val, dir);
+        int err = real_snd_pcm_hw_params_set_periods_near(pcm, params, val, dir);
         alog("audioshim: real set_periods_near res=%d periods=%u\n", err, val ? *val : 0);
         return err;
     }
@@ -388,7 +562,7 @@ int snd_pcm_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
     init_real_alsa();
     alog("audioshim: snd_pcm_hw_params(pcm=%p)\n", pcm);
     if (is_real(pcm) && real_snd_pcm_hw_params) {
-        int err = real_snd_pcm_hw_params(g_real_playback, params);
+        int err = real_snd_pcm_hw_params(pcm, params);
         alog("audioshim: real hw_params res=%d\n", err);
         return err;
     }
@@ -400,7 +574,7 @@ int snd_pcm_sw_params_current(snd_pcm_t *pcm, snd_pcm_sw_params_t *params)
     init_real_alsa();
     int err = 0;
     if (is_real(pcm) && real_snd_pcm_sw_params_current) {
-        err = real_snd_pcm_sw_params_current(g_real_playback, params);
+        err = real_snd_pcm_sw_params_current(pcm, params);
     }
     alog("audioshim: snd_pcm_sw_params_current(pcm=%p) res=%d\n", pcm, err);
     return err;
@@ -426,7 +600,7 @@ int snd_pcm_sw_params_set_silence_threshold(snd_pcm_t *pcm, snd_pcm_sw_params_t 
     init_real_alsa();
     int err = 0;
     if (is_real(pcm) && real_snd_pcm_sw_params_set_silence_threshold) {
-        err = real_snd_pcm_sw_params_set_silence_threshold(g_real_playback, params, val);
+        err = real_snd_pcm_sw_params_set_silence_threshold(pcm, params, val);
     }
     alog("audioshim: set_silence_threshold(%lu) res=%d\n", val, err);
     return 0; /* always succeed */
@@ -437,7 +611,7 @@ int snd_pcm_sw_params_set_silence_size(snd_pcm_t *pcm, snd_pcm_sw_params_t *para
     init_real_alsa();
     int err = 0;
     if (is_real(pcm) && real_snd_pcm_sw_params_set_silence_size) {
-        err = real_snd_pcm_sw_params_set_silence_size(g_real_playback, params, val);
+        err = real_snd_pcm_sw_params_set_silence_size(pcm, params, val);
     }
     alog("audioshim: set_silence_size(%lu) res=%d\n", val, err);
     return 0; /* always succeed */
@@ -448,7 +622,7 @@ int snd_pcm_sw_params_set_start_threshold(snd_pcm_t *pcm, snd_pcm_sw_params_t *p
     init_real_alsa();
     int err = 0;
     if (is_real(pcm) && real_snd_pcm_sw_params_set_start_threshold) {
-        err = real_snd_pcm_sw_params_set_start_threshold(g_real_playback, params, val);
+        err = real_snd_pcm_sw_params_set_start_threshold(pcm, params, val);
     }
     alog("audioshim: set_start_threshold(%lu) res=%d\n", val, err);
     return 0; /* always succeed */
@@ -459,7 +633,7 @@ int snd_pcm_sw_params_set_stop_threshold(snd_pcm_t *pcm, snd_pcm_sw_params_t *pa
     init_real_alsa();
     int err = 0;
     if (is_real(pcm) && real_snd_pcm_sw_params_set_stop_threshold) {
-        err = real_snd_pcm_sw_params_set_stop_threshold(g_real_playback, params, val);
+        err = real_snd_pcm_sw_params_set_stop_threshold(pcm, params, val);
     }
     alog("audioshim: set_stop_threshold(%lu) res=%d\n", val, err);
     return 0; /* always succeed */
@@ -470,7 +644,7 @@ int snd_pcm_sw_params(snd_pcm_t *pcm, snd_pcm_sw_params_t *params)
     init_real_alsa();
     int err = 0;
     if (is_real(pcm) && real_snd_pcm_sw_params) {
-        err = real_snd_pcm_sw_params(g_real_playback, params);
+        err = real_snd_pcm_sw_params(pcm, params);
     }
     alog("audioshim: snd_pcm_sw_params(pcm=%p) res=%d\n", pcm, err);
     return 0; /* always succeed */
@@ -481,7 +655,7 @@ int snd_pcm_prepare(snd_pcm_t *pcm)
     init_real_alsa();
     int err = 0;
     if (is_real(pcm) && real_snd_pcm_prepare) {
-        err = real_snd_pcm_prepare(g_real_playback);
+        err = real_snd_pcm_prepare(pcm);
     }
     alog("audioshim: snd_pcm_prepare(pcm=%p) res=%d\n", pcm, err);
     return 0; /* always succeed */
@@ -493,6 +667,86 @@ int snd_pcm_link(snd_pcm_t *pcm1, snd_pcm_t *pcm2)
     return 0;
 }
 
+/* A3: write `size` frames to the real PCM.  Loops over partial writes and
+ * recovers from xruns/suspend.  If the sink cannot take the data the frames are
+ * dropped, but never silently and never without pacing: the engine's playhead
+ * is clocked by this call (docs/08), so returning instantly would let it run
+ * away at 100 % CPU.  Returns the number of frames that were really written. */
+static unsigned long g_hw_dropped_frames = 0;
+static unsigned long g_hw_recoveries = 0;
+static unsigned long g_hw_err_logs = 0;
+
+static snd_pcm_uframes_t hw_write_all(snd_pcm_t *hw, const int32_t *buf,
+                                      snd_pcm_uframes_t size)
+{
+    snd_pcm_uframes_t done = 0;
+    int stalls = 0;
+
+    while (done < size) {
+        snd_pcm_sframes_t n = real_snd_pcm_writei(hw, buf + done * 2, size - done);
+        if (n > 0) {
+            done += (snd_pcm_uframes_t)n;
+            stalls = 0;
+            continue;
+        }
+        if (n == 0 || n == -EAGAIN || n == -EINTR) {
+            if (++stalls > 2000) break;          /* ~2 s without progress */
+            if (n != -EINTR) usleep(1000);
+            continue;
+        }
+        /* real error: -EPIPE (xrun), -ESTRPIPE (suspend), -ENODEV, -EIO ... */
+        g_hw_recoveries++;
+        if (real_snd_pcm_recover) {
+            if (real_snd_pcm_recover(hw, (int)n, 1) < 0) break;
+        } else if (real_snd_pcm_prepare) {
+            if (real_snd_pcm_prepare(hw) < 0) break;
+        } else {
+            break;
+        }
+        if (++stalls > 8) break;                 /* recover loop is not converging */
+    }
+
+    if (done < size) {
+        snd_pcm_uframes_t lost = size - done;
+        g_hw_dropped_frames += lost;
+        if ((g_hw_err_logs++ % 100) == 0)
+            alog("audioshim: HDMI sink not accepting audio: dropped %lu frame(s) total, "
+                 "%lu recovery attempt(s)\n", g_hw_dropped_frames, g_hw_recoveries);
+        usleep((useconds_t)(lost * 1000000UL / 44100UL));   /* keep the engine paced */
+    }
+    return done;
+}
+
+/* AUDIOSHIM_DUMP=1: classify the raw 32-bit words once (docs/18 A4: are the
+ * 24-bit samples sign-extended?) */
+static int g_dump_enabled = -1;
+static int g_dump_done = 0;
+
+static void dump_sample_format(const int32_t *src, snd_pcm_uframes_t size)
+{
+    unsigned long top00 = 0, topff = 0, other = 0, neg_unext = 0, nz = 0;
+    snd_pcm_uframes_t i, first = size;
+
+    for (i = 0; i < size * 2; i++) {
+        uint32_t v = (uint32_t)src[i], top = v >> 24;
+        if (!v) continue;
+        nz++;
+        if (first == size) first = i / 2;
+        if (top == 0x00) { top00++; if (v & 0x800000u) neg_unext++; }
+        else if (top == 0xff) topff++;
+        else other++;
+    }
+    if (!nz) return;
+    g_dump_done++;
+    alog("audioshim: DUMP #%d words=%lu nonzero=%lu top00=%lu topFF=%lu other=%lu "
+         "neg24_without_signext=%lu\n", g_dump_done, (unsigned long)(size * 2), nz,
+         top00, topff, other, neg_unext);
+    alog("audioshim: DUMP first nonzero frame %lu: %08x %08x %08x %08x\n",
+         (unsigned long)first, (unsigned)src[first * 2], (unsigned)src[first * 2 + 1],
+         (unsigned)src[(first + 1 < size ? first + 1 : first) * 2],
+         (unsigned)src[(first + 1 < size ? first + 1 : first) * 2 + 1]);
+}
+
 snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_uframes_t size)
 {
     init_real_alsa();
@@ -502,23 +756,25 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
         size = MAX_FRAMES;
 
     const int32_t *src = (const int32_t *)buffer;
-    static int32_t s_peak_master = 0;
-    static int32_t s_peak_hp = 0;
-    static int s_has_hp_audio = 0;
+    static int32_t s_peak_master = 0;    /* master caller only */
 
     if (pcm == (snd_pcm_t *)&g_h_hp) {
         /* Headphone stream: interleave into Ch 2 (Left) and Ch 3 (Right) */
+        int32_t pk = 0;
+        pthread_mutex_lock(&g_mix_lock);
         for (snd_pcm_uframes_t i = 0; i < size; i++) {
             int32_t l = src[i * 2 + 0];
             int32_t r = src[i * 2 + 1];
             int32_t al = (l < 0) ? -l : l;
             int32_t ar = (r < 0) ? -r : r;
-            if (al > s_peak_hp) s_peak_hp = al;
-            if (ar > s_peak_hp) s_peak_hp = ar;
+            if (al > pk) pk = al;
+            if (ar > pk) pk = ar;
             g_mix4ch[i * 4 + 2] = l;
             g_mix4ch[i * 4 + 3] = r;
         }
-        if (s_peak_hp > 100) s_has_hp_audio = 1;
+        if (pk > g_peak_hp) g_peak_hp = pk;
+        if (g_peak_hp > 100) g_has_hp_audio = 1;
+        pthread_mutex_unlock(&g_mix_lock);
         return size;
     }
 
@@ -526,36 +782,40 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
         return size;
     }
 
-    /* Master stream: interleave into Ch 0 (Left) and Ch 1 (Right) */
-    for (snd_pcm_uframes_t i = 0; i < size; i++) {
-        int32_t l = src[i * 2 + 0];
-        int32_t r = src[i * 2 + 1];
-        int32_t al = (l < 0) ? -l : l;
-        int32_t ar = (r < 0) ? -r : r;
-        if (al > s_peak_master) s_peak_master = al;
-        if (ar > s_peak_master) s_peak_master = ar;
-        g_mix4ch[i * 4 + 0] = l;
-        g_mix4ch[i * 4 + 1] = r;
-        /* Also mirror Master into Ch 2 & 3 (Headphones) if no explicit Headphone cue audio */
-        if (!s_has_hp_audio) {
-            g_mix4ch[i * 4 + 2] = l;
-            g_mix4ch[i * 4 + 3] = r;
-        }
-    }
-
+    /* Master stream: interleave into Ch 0 (Left) and Ch 1 (Right), then build
+     * the HDMI stereo pair: the headphone/cue pair when it has audio, otherwise
+     * the master pair. */
     g_write_count++;
-    snd_pcm_sframes_t written = 0;
-    /* Chromebit: downmix the RX3 4-channel mix to HDMI stereo (S24_LE).
-     * Use the headphone/cue pair when it has audio, otherwise the master pair. */
-    for (snd_pcm_uframes_t i = 0; i < size; i++) {
-        if (s_has_hp_audio) {
-            g_out2ch[i * 2 + 0] = g_mix4ch[i * 4 + 2];
-            g_out2ch[i * 2 + 1] = g_mix4ch[i * 4 + 3];
-        } else {
-            g_out2ch[i * 2 + 0] = g_mix4ch[i * 4 + 0];
-            g_out2ch[i * 2 + 1] = g_mix4ch[i * 4 + 1];
+    pthread_mutex_lock(&g_mix_lock);
+    {
+        int hp = g_has_hp_audio;
+        for (snd_pcm_uframes_t i = 0; i < size; i++) {
+            int32_t l = src[i * 2 + 0];
+            int32_t r = src[i * 2 + 1];
+            int32_t al = (l < 0) ? -l : l;
+            int32_t ar = (r < 0) ? -r : r;
+            if (al > s_peak_master) s_peak_master = al;
+            if (ar > s_peak_master) s_peak_master = ar;
+            g_mix4ch[i * 4 + 0] = l;
+            g_mix4ch[i * 4 + 1] = r;
+            if (!hp) {
+                /* mirror Master into Ch 2 & 3 (Headphones) if no explicit cue audio */
+                g_mix4ch[i * 4 + 2] = l;
+                g_mix4ch[i * 4 + 3] = r;
+            }
+            g_out2ch[i * 2 + 0] = hp ? g_mix4ch[i * 4 + 2] : l;
+            g_out2ch[i * 2 + 1] = hp ? g_mix4ch[i * 4 + 3] : r;
         }
     }
+    pthread_mutex_unlock(&g_mix_lock);
+
+    if (g_dump_enabled < 0) {
+        const char *e = getenv("AUDIOSHIM_DUMP");
+        g_dump_enabled = (e && e[0] == '1');
+    }
+    if (g_dump_enabled && g_dump_done < 3)
+        dump_sample_format(src, size);
+
     /* startup mute + fade-in over all output channels */
     startup_env_init();
     {
@@ -583,23 +843,28 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
     }
 
     /* Output stereo to real HDMI hardware */
-    if (g_real_playback && real_snd_pcm_writei) {
-        written = real_snd_pcm_writei(g_real_playback, g_out2ch, size);
-        if (written < 0) {
-            if (real_snd_pcm_prepare)
-                real_snd_pcm_prepare(g_real_playback);
-            written = real_snd_pcm_writei(g_real_playback, g_out2ch, size);
-        }
+    snd_pcm_uframes_t written = 0;
+    snd_pcm_t *hw = real_acquire();
+    if (hw && real_snd_pcm_writei) {
+        written = hw_write_all(hw, g_out2ch, size);
     } else {
         /* Safety sleep to pace real-time audio threads if hardware is delayed */
         usleep(size * 1000000 / 44100);
+        written = size;
     }
+    if (hw)
+        real_release();
 
     if ((g_write_count % 500) == 1) {
-        alog("audioshim: writei #%lu frames=%lu written=%ld peak_m=%d peak_hp=%d\n",
-             g_write_count, size, (long)written, s_peak_master, s_peak_hp);
+        int32_t hp_pk;
+        pthread_mutex_lock(&g_mix_lock);
+        hp_pk = g_peak_hp;
+        g_peak_hp = 0;
+        pthread_mutex_unlock(&g_mix_lock);
+        alog("audioshim: writei #%lu frames=%lu written=%lu peak_m=%d peak_hp=%d\n",
+             g_write_count, (unsigned long)size, (unsigned long)written,
+             s_peak_master, hp_pk);
         s_peak_master = 0;
-        s_peak_hp = 0;
     }
 
     return size;
@@ -644,25 +909,25 @@ int snd_ctl_pcm_info(snd_ctl_t *ctl, snd_pcm_info_t *info)
 }
 
 /* Scheduler & Affinity stubs to prevent single-core lockup on Rockchip */
-int pthread_setaffinity_np(pthread_t thread, size_t cpusetsize, const void *cpuset)
+int pthread_setaffinity_np(pthread_t thread, size_t cpusetsize, const cpu_set_t *cpuset)
 {
     (void)thread; (void)cpusetsize; (void)cpuset;
     return 0;
 }
 
-int sched_setaffinity(pid_t pid, size_t cpusetsize, const void *cpuset)
+int sched_setaffinity(pid_t pid, size_t cpusetsize, const cpu_set_t *cpuset)
 {
     (void)pid; (void)cpusetsize; (void)cpuset;
     return 0;
 }
 
-int sched_setscheduler(pid_t pid, int policy, const void *param)
+int sched_setscheduler(pid_t pid, int policy, const struct sched_param *param)
 {
     (void)pid; (void)policy; (void)param;
     return 0;
 }
 
-int pthread_setschedparam(pthread_t thread, int policy, const void *param)
+int pthread_setschedparam(pthread_t thread, int policy, const struct sched_param *param)
 {
     (void)thread; (void)policy; (void)param;
     return 0; /* completely disable SCHED_FIFO/SCHED_RR starvation */
@@ -674,13 +939,13 @@ int pthread_setschedprio(pthread_t thread, int prio)
     return 0;
 }
 
-int pthread_attr_setschedpolicy(void *attr, int policy)
+int pthread_attr_setschedpolicy(pthread_attr_t *attr, int policy)
 {
     (void)attr; (void)policy;
     return 0;
 }
 
-int pthread_attr_setschedparam(void *attr, const void *param)
+int pthread_attr_setschedparam(pthread_attr_t *attr, const struct sched_param *param)
 {
     (void)attr; (void)param;
     return 0;

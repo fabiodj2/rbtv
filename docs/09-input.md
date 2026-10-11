@@ -68,6 +68,14 @@ does more than read the FIFO:
   (Player 1/deck 2) with the mixer defaults — same as PrimeBox's `knobshim2`
   (PrimeBox `docs/05-controls.md` §5).
 
+### Safety gates (docs/18)
+
+`keyshim` only acts on the exact player it was written for: it hashes the `rbp`
+image and requires md5 `18a64bc4…` (`KEYSHIM_RBP_MD5=<hex>` to override), else it
+stays inert and logs `REFUSING to run`. Kill-switch: `KEYSHIM_DISABLE=1`,
+`/etc/rbtv/disable-keyshim` (host) — `start-rb.sh` also drops it automatically
+after 3 starts that die within 40 s. Source: `scripts/rb/rbtv_common.h`.
+
 ## 2. Keycodes
 
 | Name | keycode | Name | keycode |
