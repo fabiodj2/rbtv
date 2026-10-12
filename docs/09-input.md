@@ -74,7 +74,9 @@ does more than read the FIFO:
 image and requires md5 `18a64bc4…` (`KEYSHIM_RBP_MD5=<hex>` to override), else it
 stays inert and logs `REFUSING to run`. Kill-switch: `KEYSHIM_DISABLE=1`,
 `/etc/rbtv/disable-keyshim` (host) — `start-rb.sh` also drops it automatically
-after 3 starts that die within 40 s. Source: `scripts/rb/rbtv_common.h`.
+after 3 starts that die within 40 s. It also validates the KeyManager, its
+vtable and the `sendKey` target against the rbp mappings before calling, and a
+single injector thread serves both FIFOs. Source: `scripts/rb/rbtv_common.h`.
 
 ## 2. Keycodes
 

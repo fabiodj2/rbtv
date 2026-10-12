@@ -22,6 +22,13 @@
  *   A2  shared state is lock-protected; the real PCM is reference-counted so
  *       snd_pcm_close() cannot free it under a writer; one-time init is
  *       pthread_once.
+ *   A4  24-bit samples are normalised with sign extension before metering,
+ *       mixing and fading (the engine appears to leave the top byte clear, so
+ *       a negative sample looked like a huge positive one).  Hardware sees the
+ *       same low 24 bits.  AUDIOSHIM_SIGNEXT=0 turns it off for A/B tests.
+ *   A5  the "headphone/cue has audio" decision is a decaying detector (needs
+ *       100 ms above threshold to engage, holds 1.5 s after the last loud block)
+ *       instead of a latch that the start-up transient could set forever.
  *   A3  snd_pcm_writei() loops over partial writes, recovers from xruns, and
  *       when the sink is unusable it still PACES the engine (sleeps the
  *       period) and counts the dropped frames instead of returning instantly.
@@ -212,10 +219,15 @@ typedef void snd_pcm_info_t;
 static int (*real_snd_ctl_open)(snd_ctl_t **, const char *, int) = NULL;
 static int (*real_snd_ctl_close)(snd_ctl_t *) = NULL;
 
+static int g_signext = 1;            /* A4, see s24() below */
 static pthread_once_t g_alsa_once = PTHREAD_ONCE_INIT;
 
 static void init_real_alsa_once(void)
 {
+    {
+        const char *e = getenv("AUDIOSHIM_SIGNEXT");
+        if (e && e[0] == '0') g_signext = 0;
+    }
     void *lib = dlopen("libasound.so.2", RTLD_LAZY | RTLD_GLOBAL);
     if (!lib) {
         alog("audioshim: failed to dlopen libasound.so.2: %s\n", dlerror());
@@ -257,14 +269,28 @@ static void init_real_alsa(void)
 
 /* ---- shared state --------------------------------------------------------
  * g_state_lock : g_real_playback, g_playback_open_count, g_real_refs
- * g_mix_lock   : g_mix4ch, g_peak_hp, g_has_hp_audio (headphone thread writes,
+ * g_mix_lock   : g_mix4ch, g_peak_hp, cue detector (headphone thread writes,
  *                master thread reads - they may be the same thread or not)
  * Everything else below is touched only by the master writei caller. */
 static pthread_mutex_t g_state_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_mix_lock   = PTHREAD_MUTEX_INITIALIZER;
 static int g_real_refs = 0;
 static int32_t g_peak_hp = 0;
-static int g_has_hp_audio = 0;
+/* A5: cue detector, all under g_mix_lock; times are in master frames */
+#define HP_THRESHOLD      100UL      /* 24-bit counts, ~ -98 dBFS */
+#define HP_ATTACK_FRAMES  4410UL     /* 100 ms of continuous signal to engage */
+#define HP_RELEASE_FRAMES 66150UL    /* 1.5 s hold after the last loud block */
+static unsigned long long g_master_frames = 0;
+static unsigned long long g_hp_loud_until = 0;
+static unsigned long g_hp_loud_run = 0;
+static int g_hp_state = 0;           /* last decision, for transition logging */
+
+/* A4 */
+static inline int32_t s24(int32_t v)
+{
+    if (!g_signext) return v;
+    return (int32_t)((uint32_t)v << 8) >> 8;     /* sign-extend from bit 23 */
+}
 
 /* 4-channel audio buffer for Prime GO (S24_LE: 4 bytes per sample, 4 channels = 16 bytes/frame) */
 #define MAX_FRAMES 4096
@@ -763,8 +789,8 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
         int32_t pk = 0;
         pthread_mutex_lock(&g_mix_lock);
         for (snd_pcm_uframes_t i = 0; i < size; i++) {
-            int32_t l = src[i * 2 + 0];
-            int32_t r = src[i * 2 + 1];
+            int32_t l = s24(src[i * 2 + 0]);
+            int32_t r = s24(src[i * 2 + 1]);
             int32_t al = (l < 0) ? -l : l;
             int32_t ar = (r < 0) ? -r : r;
             if (al > pk) pk = al;
@@ -773,7 +799,13 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
             g_mix4ch[i * 4 + 3] = r;
         }
         if (pk > g_peak_hp) g_peak_hp = pk;
-        if (g_peak_hp > 100) g_has_hp_audio = 1;
+        if ((unsigned long)pk > HP_THRESHOLD) {
+            g_hp_loud_run += size;
+            if (g_hp_loud_run >= HP_ATTACK_FRAMES)
+                g_hp_loud_until = g_master_frames + HP_RELEASE_FRAMES;
+        } else {
+            g_hp_loud_run = 0;
+        }
         pthread_mutex_unlock(&g_mix_lock);
         return size;
     }
@@ -786,12 +818,16 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
      * the HDMI stereo pair: the headphone/cue pair when it has audio, otherwise
      * the master pair. */
     g_write_count++;
+    int hp_changed = 0, hp_now = 0;
     pthread_mutex_lock(&g_mix_lock);
     {
-        int hp = g_has_hp_audio;
+        int hp = g_master_frames < g_hp_loud_until;
+        g_master_frames += size;
+        if (hp != g_hp_state) { g_hp_state = hp; hp_changed = 1; }
+        hp_now = hp;
         for (snd_pcm_uframes_t i = 0; i < size; i++) {
-            int32_t l = src[i * 2 + 0];
-            int32_t r = src[i * 2 + 1];
+            int32_t l = s24(src[i * 2 + 0]);
+            int32_t r = s24(src[i * 2 + 1]);
             int32_t al = (l < 0) ? -l : l;
             int32_t ar = (r < 0) ? -r : r;
             if (al > s_peak_master) s_peak_master = al;
@@ -808,6 +844,9 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
         }
     }
     pthread_mutex_unlock(&g_mix_lock);
+    if (hp_changed)
+        alog("audioshim: cue/headphone pair %s the HDMI output\n",
+             hp_now ? "now feeds" : "released");
 
     if (g_dump_enabled < 0) {
         const char *e = getenv("AUDIOSHIM_DUMP");

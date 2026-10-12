@@ -156,6 +156,9 @@ after startup. `audioshim.so` holds every output channel at zero for
   stops accepting data it counts dropped frames and sleeps one period so the
   engine's playhead stays paced (look for `HDMI sink not accepting audio`).
 * `AUDIOSHIM_DUMP=1` logs the raw sample layout (sign extension check).
+* 24-bit samples are sign-extended before metering/mixing/fading
+  (`AUDIOSHIM_SIGNEXT=0` to disable), and the headphone/cue pair only replaces
+  the master pair while the cue has ≥100 ms of signal (1.5 s hold, no latch).
 
 ## 8. Files
 

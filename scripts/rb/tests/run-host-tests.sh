@@ -28,6 +28,12 @@ $CC -O2 -Wall -Wno-int-to-pointer-cast -Wno-unused-function -I"$RB" \
     -o "$W/pumptest" "$HERE/pumptest.c" -lpthread
 "$W/pumptest" || fail=1
 
+echo "== keyshim injector, K3/K4 (mocked engine + real FIFOs) =="
+$CC -O2 -Wall -Wno-int-to-pointer-cast -Wno-unused-function -Wno-address-of-packed-member \
+    -I"$RB" -o "$W/injecttest" "$HERE/injecttest.c" -lpthread
+rm -f /tmp/keyshim.log
+timeout 60 "$W/injecttest" || fail=1
+
 echo "== keyshim identity / kill-switch (K1, K11) =="
 $CC -O2 -fPIC -shared -Wno-int-to-pointer-cast -o "$W/keyshim.so" "$RB/keyshim.c" -lpthread
 cp /bin/sleep "$W/rbp"; cp /bin/sleep "$W/other"

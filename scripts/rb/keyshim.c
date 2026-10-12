@@ -22,6 +22,11 @@
  *       Any mismatch => the shim stays completely inert (no writes, no calls).
  *   K2  UiMain's openDevice() is not idempotent: it is called at most once per
  *       "pump not running" episode, under a lock, with a retry back-off.
+ *   K3  object/vtable sanity: the KeyManager, its vtable and the sendKey target
+ *       must look right (aligned; vtable inside the rbp image; function inside
+ *       an executable rbp mapping) before they are dereferenced/called.
+ *   K4  ONE injector thread serves both FIFOs (no concurrent sendKey from the
+ *       shim, no cross-thread flags).
  *   K11 kill-switch: KEYSHIM_DISABLE=1, /etc/rbtv/disable-keyshim or
  *       /etc/rbtv/disable-shims (checked inside the chroot).
  */
@@ -47,6 +52,10 @@ static int real_open(const char *p, int flags)
 static ssize_t real_read(int fd, void *buf, size_t n)
 {
     return syscall(SYS_read, fd, buf, n);
+}
+static int real_close(int fd)
+{
+    return syscall(SYS_close, fd);
 }
 
 /* ---- tiny logger (raw syscalls, no printf) ---- */
@@ -95,6 +104,67 @@ static void klog_dec(const char *label, int v)
 static pthread_once_t verify_once = PTHREAD_ONCE_INIT;
 static volatile int shim_ok = 0;   /* written once inside verify_once */
 
+/* K3: address ranges of the rbp image, read from /proc/self/maps once the md5
+ * matched.  img = any rbp mapping (vtables live in rodata/data), txt = the
+ * executable ones (virtual-call targets).  KEYSHIM_NO_RANGE_CHECK=1 turns the
+ * range test off (diagnostics only; alignment/NULL checks stay). */
+static unsigned long img_lo, img_hi, txt_lo, txt_hi;
+
+static int load_image_ranges(void)
+{
+    static char maps[65536];
+    int fd = real_open("/proc/self/maps", O_RDONLY);
+    size_t len = 0;
+    ssize_t n;
+    char *line, *end;
+
+    if (fd < 0) return 0;
+    while (len < sizeof(maps) - 1 &&
+           (n = real_read(fd, maps + len, sizeof(maps) - 1 - len)) > 0)
+        len += (size_t)n;
+    real_close(fd);
+    maps[len] = 0;
+
+    for (line = maps; *line; line = end) {
+        unsigned long lo, hi;
+        char perms[8] = "";
+        char *path;
+        int off = 0;
+
+        end = strchr(line, '\n');
+        if (end) *end++ = 0; else end = line + strlen(line);
+        if (sscanf(line, "%lx-%lx %7s %*s %*s %*s %n", &lo, &hi, perms, &off) < 3)
+            continue;
+        path = line + off;
+        if (!off || !*path || !rbtv_is_rbp_name(path))
+            continue;
+        if (!img_hi) { img_lo = lo; img_hi = hi; }
+        if (lo < img_lo) img_lo = lo;
+        if (hi > img_hi) img_hi = hi;
+        if (perms[2] == 'x') {
+            if (!txt_hi) { txt_lo = lo; txt_hi = hi; }
+            if (lo < txt_lo) txt_lo = lo;
+            if (hi > txt_hi) txt_hi = hi;
+        }
+    }
+    return img_hi && txt_hi;
+}
+
+static int valid_obj(const void *p)
+{
+    return p && ((unsigned long)p & 3) == 0 && (unsigned long)p >= 0x10000UL;
+}
+static int in_img(const void *p)
+{
+    unsigned long v = (unsigned long)p;
+    return valid_obj(p) && v >= img_lo && v < img_hi;
+}
+static int in_txt(const void *p)
+{
+    unsigned long v = (unsigned long)p;
+    return v >= txt_lo && v < txt_hi;
+}
+
 static void do_verify(void)
 {
     char path[256], got[33], msg[200];
@@ -119,7 +189,15 @@ static void do_verify(void)
         klog_str(msg);
         return;
     }
-    snprintf(msg, sizeof(msg), "keyshim: rbp image verified (md5 %s)\n", got);
+    if (getenv("KEYSHIM_NO_RANGE_CHECK")) {
+        img_lo = 0; img_hi = ~0UL; txt_lo = 0; txt_hi = ~0UL;
+    } else if (!load_image_ranges()) {
+        klog_str("keyshim: cannot find the rbp mappings in /proc/self/maps; inert\n");
+        return;
+    }
+    snprintf(msg, sizeof(msg),
+             "keyshim: rbp image verified (md5 %s) img=%08lx-%08lx text=%08lx-%08lx\n",
+             got, img_lo, img_hi, txt_lo, txt_hi);
     klog_str(msg);
     shim_ok = 1;
 }
@@ -131,7 +209,9 @@ static int shim_enabled(void)
 }
 
 /* ---- KeyManager injection ---- */
+#ifndef UI_OBJ_MGR_GLOBAL
 #define UI_OBJ_MGR_GLOBAL 0x2685f2cUL
+#endif
 #define KEY_MANAGER_OFF   100
 #define SENDKEY_VTABLE_WORD 2
 
@@ -149,7 +229,7 @@ static void *get_key_manager(void)
     p = (void **)UI_OBJ_MGR_GLOBAL;
     if (!p) return NULL;
     mgr = *p;
-    if (!mgr) return NULL;
+    if (!valid_obj(mgr)) return NULL;
     return *(void **)((char *)mgr + KEY_MANAGER_OFF);
 }
 
@@ -161,21 +241,29 @@ typedef void (*sendkey_fn)(void *km, int keycode, int op, int ch,
  * shim (the engine's own UI thread is outside our control). */
 static pthread_mutex_t inject_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static void warn_once(int *flag, const char *msg)
+{
+    if (!*flag) { *flag = 1; klog_str(msg); }
+}
+
 static int send_locked(int keycode, int op, int ch, long param, float f, long l,
                        int verbose)
 {
     void *km, **vt;
     sendkey_fn fn;
     int ok = 0;
+    static int w_obj, w_vt, w_fn;
 
     pthread_mutex_lock(&inject_lock);
     km = get_key_manager();
     if (!km) {
         if (verbose) klog_str("send_rx_key: no key manager\n");
-    } else if (!(vt = *(void ***)km)) {
-        if (verbose) klog_str("send_rx_key: vtable null\n");
-    } else if (!(fn = (sendkey_fn)vt[SENDKEY_VTABLE_WORD])) {
-        if (verbose) klog_str("send_rx_key: vtable fn null\n");
+    } else if (!valid_obj(km)) {
+        warn_once(&w_obj, "keyshim: KeyManager pointer is not a plausible object; not injecting\n");
+    } else if (!in_img(vt = *(void ***)km)) {
+        warn_once(&w_vt, "keyshim: KeyManager vtable is outside the rbp image; not injecting\n");
+    } else if (!in_txt(fn = (sendkey_fn)vt[SENDKEY_VTABLE_WORD])) {
+        warn_once(&w_fn, "keyshim: sendKey target is outside rbp text; not injecting\n");
     } else {
         fn(km, keycode, op, ch, param, f, l);
         ok = 1;
@@ -202,10 +290,18 @@ static void send_rx_key_fl(int keycode, int op, int ch, long param, float f, lon
  * same sound).  Pin them like PrimeBox's knobshim2 (docs/05 §5):
  *   ch1 -> route object 0x01149f08 (Player 0 / deck 1)
  *   ch2 -> route object 0x01149f10 (Player 1 / deck 2)   */
+#ifndef MIX_ROUTE_CH1
 #define MIX_ROUTE_CH1   0x01149f50UL
+#endif
+#ifndef MIX_ROUTE_CH2
 #define MIX_ROUTE_CH2   0x01149f54UL
+#endif
+#ifndef MIX_ROUTE_PLAYER0
 #define MIX_ROUTE_PLAYER0 0x01149f08UL
+#endif
+#ifndef MIX_ROUTE_PLAYER1
 #define MIX_ROUTE_PLAYER1 0x01149f10UL
+#endif
 
 static void mixer_route(void)
 {
@@ -339,7 +435,9 @@ static int ui_pump_ensure(void)
  * initialisation.  While non-zero the UI disables browse/touch handling.
  * On the phone no USB mount ever runs the
  * code that clears it, so clear it ourselves (same as knobshim2's usb_auto). */
+#ifndef BROWSE_CAUTION_ID
 #define BROWSE_CAUTION_ID 0x05a191fcUL
+#endif
 
 static void clear_browse_caution(void)
 {
@@ -351,8 +449,12 @@ static void clear_browse_caution(void)
 }
 
 /* ---- FIFO input ---- */
+#ifndef KEY_FIFO
 #define KEY_FIFO  "/tmp/rb-keys.fifo"
+#endif
+#ifndef CTRL_FIFO
 #define CTRL_FIFO "/tmp/rb-ctrl.fifo"
+#endif
 
 struct key_ev {
     int32_t key;
@@ -377,19 +479,85 @@ struct ctrl_ev {
 /* Set once a real control surface starts feeding /tmp/rb-ctrl.fifo: from then
  * on the synthetic mixer defaults are no longer re-applied every 10 s (they
  * would snap the physical faders/EQ back). */
-static volatile int ctrl_surface_active = 0;
+static int ctrl_surface_active = 0;   /* injector thread only (K4) */
 
-static void *key_thread(void *arg)
+/* one 12-byte button record */
+static void handle_key_rec(const unsigned char *rec)
 {
-    struct pollfd pfd;
-    int fd = -1;
+    struct key_ev ev;
+    memcpy(&ev, rec, sizeof(ev));
+
+    if (ev.key == 0x7f01) {   /* host trigger: re-send mixer defaults */
+        mixer_defaults();
+        return;
+    }
+    if (ev.key == 0x7f02) {   /* host trigger: rotate browse knob */
+        send_rx_key_fl(0x420c, OP_ROTATE, 1, ev.down, 0.0f, 0);
+        return;
+    }
+    ui_pump_ensure();   /* restart pump if it ever exits (guarded, K2) */
+    klog_dec("keyshim: got key ch=", ev.ch);
+    klog_dec("         down=", ev.down);
+    send_rx_key(ev.key, ev.down ? OP_PRESS : OP_RELEASE, ev.ch);
+}
+
+/* one 24-byte controller record, forwarded straight to
+ * sendKey(key, op, ch, param, f, l) - what the DDJ-400 bridge / rbkeyd write */
+static void handle_ctrl_rec(const unsigned char *rec)
+{
+    struct ctrl_ev ev;
+    memcpy(&ev, rec, sizeof(ev));
+
+    ctrl_surface_active = 1;
+    ui_pump_ensure();
+    klog_hex("keyshim: ctrl key=", (unsigned)ev.key);
+    klog_dec("         op=", ev.op);
+    klog_dec("         ch=", ev.ch);
+    klog_dec("         param=", ev.param);
+    send_rx_key_fl(ev.key, ev.op, ev.ch, ev.param, ev.f, ev.l);
+}
+
+/* Feed one FIFO: accumulate `want` bytes (a writer may deliver a record in
+ * several write()s), dispatch each complete record.  Returns 0 normally, -1 on
+ * a hard read error (caller drops the fd). */
+static int drain_fifo(int fd, unsigned char *rec, size_t want, size_t *have,
+                      void (*handle)(const unsigned char *))
+{
+    int k;
+    for (k = 0; k < 64; k++) {              /* bounded burst per wake-up */
+        ssize_t n = real_read(fd, rec + *have, want - *have);
+        if (n > 0) {
+            *have += (size_t)n;
+            if (*have == want) {
+                *have = 0;
+                handle(rec);
+            }
+            continue;
+        }
+        if (n < 0 && errno != EAGAIN && errno != EINTR)
+            return -1;
+        break;
+    }
+    return 0;
+}
+
+/* K4: the only thread that talks to the engine.  It owns both FIFOs, so
+ * sendKey()/mixer defaults/pump handling are never concurrent with each other
+ * and the ctrl_surface_active flag needs no cross-thread synchronisation. */
+static void *inject_thread(void *arg)
+{
+    struct pollfd pfd[2];
+    unsigned char krec[sizeof(struct key_ev)], crec[sizeof(struct ctrl_ev)];
+    size_t klen = 0, clen = 0;
+    int kfd = -1, cfd = -1, i;
+    time_t last_mix;
     (void)arg;
 
     if (!shim_enabled())
         return NULL;                          /* K1/K11: stay inert */
     klog_str("keyshim: thread started\n");
 
-    for (int i = 0; i < 300; i++) {
+    for (i = 0; i < 300; i++) {
         if (get_key_manager())
             break;
         usleep(100000);
@@ -405,7 +573,7 @@ static void *key_thread(void *arg)
 
     /* Wait for the panel devices to be registered, then make sure the UiMain
      * message-pump thread exists (it is what dispatches posted keys). */
-    for (int i = 0; i < 150; i++) {
+    for (i = 0; i < 150; i++) {
         if (ui_pump_ensure())
             break;
         usleep(100000);                       /* never spin on openDevice() */
@@ -417,139 +585,53 @@ static void *key_thread(void *arg)
     klog_str("keyshim: mixer defaults sent (ch1->deck1, ch2->deck2, faders up, "
              "trims/EQ/crossfader center)\n");
 
-    for (int i = 0; i < 100; i++) {
-        fd = real_open(KEY_FIFO, O_RDWR | O_NONBLOCK);
-        if (fd >= 0)
-            break;
-        usleep(100000);
+    for (i = 0; i < 100 && (kfd < 0 || cfd < 0); i++) {
+        if (kfd < 0) kfd = real_open(KEY_FIFO, O_RDWR | O_NONBLOCK);
+        if (cfd < 0) cfd = real_open(CTRL_FIFO, O_RDWR | O_NONBLOCK);
+        if (kfd < 0 || cfd < 0)
+            usleep(100000);
     }
-    if (fd < 0) {
+    if (kfd < 0 && cfd < 0) {
         klog_str("keyshim: fifo open failed\n");
         return NULL;
     }
-    klog_str("keyshim: fifo open ok\n");
+    klog_str(kfd >= 0 ? "keyshim: fifo open ok\n" : "keyshim: key fifo open FAILED\n");
+    klog_str(cfd >= 0 ? "keyshim: ctrl fifo open ok\n" : "keyshim: ctrl fifo open FAILED\n");
 
-    pfd.fd = fd;
-    pfd.events = POLLIN;
-
-    /* The FIFO record is 12 bytes, but a writer may deliver it in several
-     * write()s (this shim's own /tmp injectors do).  Accumulate across reads
-     * instead of discarding partial data. */
-    unsigned char rec[sizeof(struct key_ev)];
-    size_t rec_len = 0;
-
-    time_t last_mix = time(0);
+    last_mix = time(0);
     for (;;) {
-        int pr = poll(&pfd, 1, 500);
+        time_t now;
+        int pr;
+
+        pfd[0].fd = kfd; pfd[0].events = POLLIN; pfd[0].revents = 0;
+        pfd[1].fd = cfd; pfd[1].events = POLLIN; pfd[1].revents = 0;
+        pr = poll(pfd, 2, 500);               /* fd == -1 entries are ignored */
+
         clear_browse_caution();   /* keep the USB-error popup dismissed */
         /* The mixer objects are created well after startup, so the first send
          * is often lost; keep re-applying them (idempotent, nothing physical
          * can change them on the phone). */
-        time_t now = time(0);
+        now = time(0);
         if (!ctrl_surface_active && now - last_mix >= 10) {
             mixer_defaults();
             last_mix = now;
         }
         if (pr <= 0)
             continue;
-        ssize_t n = real_read(fd, rec + rec_len, sizeof(rec) - rec_len);
-        if (n > 0) {
-            rec_len += (size_t)n;
-            if (rec_len == sizeof(rec)) {
-                struct key_ev ev;
-                memcpy(&ev, rec, sizeof(ev));
-                rec_len = 0;
 
-                if (ev.key == 0x7f01) {   /* host trigger: re-send mixer defaults */
-                    mixer_defaults();
-                    continue;
-                }
-                if (ev.key == 0x7f02) {   /* host trigger: rotate browse knob */
-                    send_rx_key_fl(0x420c, OP_ROTATE, 1, ev.down, 0.0f, 0);
-                    continue;
-                }
-                ui_pump_ensure();   /* restart pump if it ever exits */
-                klog_dec("keyshim: got key ch=", ev.ch);
-                klog_dec("         down=", ev.down);
-                send_rx_key(ev.key, ev.down ? OP_PRESS : OP_RELEASE, ev.ch);
-            }
-        } else if (n < 0 && errno != EAGAIN && errno != EINTR) {
-            break;
+        if (kfd >= 0 && (pfd[0].revents & (POLLIN | POLLERR | POLLNVAL)) &&
+            drain_fifo(kfd, krec, sizeof(krec), &klen, handle_key_rec) < 0) {
+            klog_str("keyshim: key fifo read error; closing it\n");
+            real_close(kfd); kfd = -1; klen = 0;
         }
-    }
-    return NULL;
-}
-
-/* ---- controller FIFO (/tmp/rb-ctrl.fifo) ----
- * 24-byte records, forwarded straight to sendKey(key, op, ch, param, f, l).
- * This is what the DDJ-400 MIDI bridge writes, so a real controller can drive
- * the engine's faders, EQ, jog wheels and relative knobs. */
-static void *ctrl_thread(void *arg)
-{
-    struct pollfd pfd;
-    int fd = -1;
-    (void)arg;
-
-    if (!shim_enabled())
-        return NULL;                          /* K1/K11: stay inert */
-    klog_str("keyshim: ctrl thread started\n");
-
-    for (int i = 0; i < 300; i++) {
-        if (get_key_manager())
-            break;
-        usleep(100000);
-    }
-    if (!get_key_manager()) {
-        klog_str("keyshim: ctrl thread: key manager never ready\n");
-        return NULL;
-    }
-
-    for (int i = 0; i < 150; i++) {
-        if (ui_pump_ensure())
-            break;
-        usleep(100000);                       /* never spin on openDevice() */
-    }
-
-    for (int i = 0; i < 100; i++) {
-        fd = real_open(CTRL_FIFO, O_RDWR | O_NONBLOCK);
-        if (fd >= 0)
-            break;
-        usleep(100000);
-    }
-    if (fd < 0) {
-        klog_str("keyshim: ctrl fifo open failed\n");
-        return NULL;
-    }
-    klog_str("keyshim: ctrl fifo open ok\n");
-
-    pfd.fd = fd;
-    pfd.events = POLLIN;
-
-    unsigned char rec[sizeof(struct ctrl_ev)];
-    size_t rec_len = 0;
-
-    for (;;) {
-        int pr = poll(&pfd, 1, 1000);
-        clear_browse_caution();
-        if (pr <= 0)
-            continue;
-        ssize_t n = real_read(fd, rec + rec_len, sizeof(rec) - rec_len);
-        if (n > 0) {
-            rec_len += (size_t)n;
-            if (rec_len == sizeof(rec)) {
-                struct ctrl_ev ev;
-                memcpy(&ev, rec, sizeof(ev));
-                rec_len = 0;
-                ctrl_surface_active = 1;
-                ui_pump_ensure();
-                klog_hex("keyshim: ctrl key=", (unsigned)ev.key);
-                klog_dec("         op=", ev.op);
-                klog_dec("         ch=", ev.ch);
-                klog_dec("         param=", ev.param);
-                send_rx_key_fl(ev.key, ev.op, ev.ch, ev.param, ev.f, ev.l);
-            }
-        } else if (n < 0 && errno != EAGAIN && errno != EINTR) {
-            break;
+        if (cfd >= 0 && (pfd[1].revents & (POLLIN | POLLERR | POLLNVAL)) &&
+            drain_fifo(cfd, crec, sizeof(crec), &clen, handle_ctrl_rec) < 0) {
+            klog_str("keyshim: ctrl fifo read error; closing it\n");
+            real_close(cfd); cfd = -1; clen = 0;
+        }
+        if (kfd < 0 && cfd < 0) {
+            klog_str("keyshim: both fifos gone; injector exiting\n");
+            return NULL;
         }
     }
     return NULL;
@@ -568,8 +650,6 @@ static void keyshim_init(void)
         return;
     if (rbtv_shim_disabled("keyshim", "KEYSHIM_DISABLE"))
         return;
-    if (pthread_create(&tid, NULL, key_thread, NULL) == 0)
-        pthread_detach(tid);
-    if (pthread_create(&tid, NULL, ctrl_thread, NULL) == 0)
+    if (pthread_create(&tid, NULL, inject_thread, NULL) == 0)
         pthread_detach(tid);
 }

@@ -55,8 +55,9 @@ not as proof about any specific build.
 ## Status checklist (audited — see [18-shim-audit](18-shim-audit.md))
 
 - [x] Runtime verification of the rbp image before keyshim touches it (md5, docs/18 K1); patch-site byte checks already exist in `patch-rbp-crashguards.py`
-- [ ] `keyshim` → FIFO path: confirm no stored `IKeyManager` pointer across
-      threads (see latent `keyshim`/`UiMain` crash in [16-handoff](16-handoff.md))
+- [x] `keyshim` → FIFO path: no stored `IKeyManager` pointer, one injector thread,
+      vtable/target validated, `openDevice` one-shot (docs/18 K2–K4; was the latent
+      crash in [16-handoff](16-handoff.md) §5)
 - [x] `audioshim`: no logging/I/O in the ALSA callback (docs/18 A1); [ ] open pop still open
 - [x] audioshim log capped/rotated; [ ] keyshim, `rb.service` and the MIDI bridge logs still unbounded
 - [ ] Verify nothing runs with real-time priority except audio, deliberately
