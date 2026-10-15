@@ -745,6 +745,13 @@ static int stems_pads_touch;
 #define STEMS_TOUCH_OPEN 0x20
 #define STEMS_TOUCH_KEY_OPEN 0x21
 #define STEMS_TOUCH_KEY_PART 0x30   /* +0 -1, +1 own key, +2 +1 */
+/* SHIFT+HOTCUE delete, toolkit-core route (2026-10-15): the rbpi4b shim's
+ * pointsrc.c reads this off the same touch FIFO and calls rbp's native
+ * hotcue_delete() directly -- see that file. STEMS_PAD_HOTCUE_DELETE_BASE
+ * above is the legacy-core route (a command file only librx3_core.so ever
+ * read); RX3_CORE=toolkit (the default since 2026-10-14) reads no such file,
+ * which is why this gesture went silent until this route was added. */
+#define STEMS_TOUCH_HOTCUE_DELETE_BASE 0x40 /* +0..+7 = pad 1..8 */
 static void stems_touch_send(int deck, int control);
 static uint32_t stems_pad_state_sequence;
 static uint32_t key_pad_state_sequence;
@@ -826,11 +833,18 @@ static void handle_pad(int deck, int note, int on, int shifted)
     /*
      * SHIFT + HOT CUE usa a função nativa de exclusão dentro do RBP.
      * Somente a borda de pressão gera o comando; a liberação é consumida.
+     * Toolkit core: a legacy command-file route below reaches nothing (see
+     * STEMS_TOUCH_HOTCUE_DELETE_BASE's comment), so this goes out the same
+     * touch FIFO KEY/STEMS already use whenever RX3_STEMS_PADS=touch.
      */
     if (shifted && mode == 0) {
-        if (on)
-            stems_pad_send_command(
-                deck, STEMS_PAD_HOTCUE_DELETE_BASE + idx);
+        if (on) {
+            if (stems_pads_touch)
+                stems_touch_send(deck, STEMS_TOUCH_HOTCUE_DELETE_BASE + idx);
+            else
+                stems_pad_send_command(
+                    deck, STEMS_PAD_HOTCUE_DELETE_BASE + idx);
+        }
 
         if (opt_verbose)
             logmsg("  HOT CUE NATIVE DELETE deck%d pad%d %s\n",
@@ -1633,6 +1647,43 @@ static void key_pad_state_tick(int midi_fd)
                packet.leds[0], packet.leds[1]);
 }
 
+/* BEAT FX ON/OFF LED (2026-10-15): driven from rbp's own real on/off state
+ * (the rbpi4b shim's UiGetMixBeatFxOn poll, rbp_abi.h), not a locally-toggled
+ * guess. A touchscreen tap of the same control (fx_zone.c's FX_ACT_POWER)
+ * sends K_BFX straight to rbp and keeps no shadow state of its own, so the
+ * old `led_beat_fx ^= 1` on every physical press (led_handle_input) went
+ * wrong the moment a touch toggle and the next physical press disagreed:
+ * the LED (and the next press's assumed starting point) tracked presses
+ * counted here, not the engine's real state. */
+#define BFX_STATE_MAGIC 0x53584642u /* "BFXS" */
+struct bfx_state_packet { uint32_t magic, sequence; uint8_t on, reserved[3]; };
+static uint32_t bfx_state_sequence;
+static int bfx_state_fd = -1;
+
+static void bfx_state_tick(int midi_fd)
+{
+    static char path[512];
+    struct bfx_state_packet packet;
+
+    if (!path[0])
+        stems_pad_sibling_path(path, sizeof(path), "rx3-bfx-state.bin");
+    if (bfx_state_fd < 0)
+        bfx_state_fd = open(path, O_RDONLY | O_NONBLOCK);
+    if (bfx_state_fd < 0)
+        return;
+    if (pread(bfx_state_fd, &packet, sizeof(packet), 0) !=
+            (ssize_t)sizeof(packet) ||
+        packet.magic != BFX_STATE_MAGIC ||
+        packet.sequence == bfx_state_sequence)
+        return;
+    bfx_state_sequence = packet.sequence;
+    led_beat_fx = packet.on ? 1 : 0;
+    led_send(midi_fd, 4, 0x47, led_beat_fx);
+    if (opt_verbose)
+        logmsg("  BEAT FX LED -> %s (rbp's own state)\n",
+               led_beat_fx ? "on" : "off");
+}
+
 static void native_led_state_init_path(void)
 {
     const char *slash = strrchr(fifo_path, '/');
@@ -2225,12 +2276,10 @@ static void led_handle_input(int fd, int channel, int note, int on)
         return;
     }
 
-    if (channel == 4 && note == 0x47) { /* BEAT FX ON/OFF */
-        if (on) {
-            led_beat_fx ^= 1;
-            led_send(fd, 4, 0x47, led_beat_fx);
-        }
-    }
+    /* BEAT FX ON/OFF LED: driven from rbp's real state by bfx_state_tick(),
+     * not a blind local toggle here any more (see its own comment) -- the
+     * physical press still reaches rbp as K_BFX through the plain notemap
+     * dispatch in handle_note(), unrelated to this LED-only function. */
 }
 
 /* ---------------- device discovery ---------------- */
@@ -2447,6 +2496,7 @@ static void run_device(int fd)
             native_led_state_tick(fd);
             stems_pad_state_tick(fd);
             key_pad_state_tick(fd);
+            bfx_state_tick(fd);
             pad_led_tick(fd);
             color_fx_led_tick(fd);
             search_led_tick(fd);
@@ -2497,6 +2547,7 @@ static void run_device(int fd)
             native_led_state_tick(fd);
             stems_pad_state_tick(fd);
             key_pad_state_tick(fd);
+            bfx_state_tick(fd);
             pad_led_tick(fd);
             color_fx_led_tick(fd);
             search_led_tick(fd);
