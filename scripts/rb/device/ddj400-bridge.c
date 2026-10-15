@@ -67,6 +67,18 @@
 #define K_PLAY        0x4101
 #define K_QUANTIZE   0x410b
 #define K_CUE         0x4102
+#define K_AUTOCUE     0x410a   /* keycode id from github.com/mutlisensor/Rx3-flx4
+                                 * (v1.19 firmware, dumped as "TimeMode/ACue").
+                                 * Genuinely dual-purpose, confirmed by disassembling
+                                 * ui::PlayerInnards::onKey_TimeAutoCue() in our own
+                                 * (unstripped) v1.20 rbp: it only calls
+                                 * DjEngineIF::setAutoCueOn() when an internal
+                                 * press-duration flag == 1, else no-ops and a separate
+                                 * handler flips TimeMode (REMAIN/TIME display) instead.
+                                 * Live-confirmed 2026-09-30: a quick tap toggles
+                                 * TimeMode, holding it toggles AUTO CUE -- same as the
+                                 * real XDJ-RX3 button's own behavior, not a bridge
+                                 * artifact. */
 #define K_VINYL      0x4104
 #define K_SYNC        0x4112
 #define K_JOG_TOUCH   0x4306
@@ -728,6 +740,15 @@ static void pad_select_bank(int deck, int ddj_mode)
 
 #define STEMS_PAD_HOTCUE_DELETE_BASE 0x10
 
+/* Set from RX3_STEMS_PADS=touch in main(); see handle_pad(). */
+static int stems_pads_touch;
+#define STEMS_TOUCH_OPEN 0x20
+#define STEMS_TOUCH_KEY_OPEN 0x21
+#define STEMS_TOUCH_KEY_PART 0x30   /* +0 -1, +1 own key, +2 +1 */
+static void stems_touch_send(int deck, int control);
+static uint32_t stems_pad_state_sequence;
+static uint32_t key_pad_state_sequence;
+
 static void stems_pad_send_command(int deck, int control);
 
 /* Sound Color FX type select (PAD FX1 page, mode 1, reached via SHIFT+BEAT
@@ -757,6 +778,29 @@ static void handle_pad(int deck, int note, int on, int shifted)
      * same STEMS page, by user request. Pads 1-3 mirror the touchscreen
      * DRUMS/VOCAL/INST controls; pads 4-8 remain reserved. */
     if (mode == 5 || mode == 7) {
+        /* RX3_STEMS_PADS=touch (rbpi4b launcher, RX3_CORE=toolkit): the
+         * rx3-toolkit core reads no command file, so the command goes to the
+         * rbpi4b touch shim, which taps the toolkit's STEMS panel (pointsrc.c,
+         * "THE DDJ-400'S STEMS PAGE"). No pad-mode key is sent: the deck
+         * stays in its pad mode and the STEMS panel stays open. Pads 1-3 are
+         * the panel's order, INST/VOCAL/DRUMS; their LEDs come back through
+         * rx3-stems-pad-state.bin, written by the shim (stems_pad_state_tick). */
+        if (stems_pads_touch) {
+            /* Mode 7 (KEY SHIFT, SHIFT+SAMPLER) is the toolkit's KEY panel:
+             * pads 1-3 = -1 / the track's own key / +1; LEDs back through
+             * rx3-key-pad-state.bin (key_pad_state_tick). */
+            if (on && idx < 3)
+                stems_touch_send(deck, mode == 7 ? STEMS_TOUCH_KEY_PART + idx : idx);
+            /* The DDJ drives a pressed pad's LED itself (off on release), so
+             * a press that changes nothing -- pad 2 at the track's own key --
+             * would leave it dark: resend this page's LEDs from the state on
+             * the next tick, after every edge. */
+            if (mode == 7)
+                key_pad_state_sequence = 0;
+            else
+                stems_pad_state_sequence = 0;
+            return;
+        }
         if (on && idx < 3)
             stems_pad_send_command(deck, idx);
         return;
@@ -941,6 +985,19 @@ static const struct notemap notemap[] = {
     { MC_DECK2, 0x11, K_LOOPOUT, 0, "LOOP OUT" },
     { MC_DECK1, 0x4D, K_RELOOP,  0, "RELOOP/EXIT" },
     { MC_DECK2, 0x4D, K_RELOOP,  0, "RELOOP/EXIT" },
+    /* SHIFT+RELOOP/EXIT (note 0x50, deck channel): unused by this bridge and
+     * by the official notemap (the hardware doesn't renumber RELOOP/EXIT's
+     * own note under SHIFT the way PLAY/CUE/LOAD do -- confirmed against the
+     * Mixxx Pioneer-DDJ-400 mapping, which independently lists 0x50 as this
+     * button's own separate SHIFT note, "Reloop and stop"). Repurposed here
+     * for AUTO CUE, which has no dedicated DDJ-400 button.
+     * Live-confirmed 2026-09-30: forwarding raw press/release lets the
+     * engine's own short/long-press timing decide, same as real hardware --
+     * a quick tap flips TimeMode (REMAIN/TIME) instead of AUTO CUE (see
+     * K_AUTOCUE above); holding it briefly (~1s) toggles AUTO CUE. Not a
+     * bridge bug -- both reactions are the real button's own behavior. */
+    { MC_DECK1, 0x50, K_AUTOCUE, 0, "SHIFT+RELOOP/EXIT hold -> AUTO CUE (tap -> TimeMode)" },
+    { MC_DECK2, 0x50, K_AUTOCUE, 0, "SHIFT+RELOOP/EXIT hold -> AUTO CUE (tap -> TimeMode)" },
     { MC_DECK1, 0x51, K_CALLPREV, 0, "CUE/LOOP CALL 1/2X" },
     { MC_DECK1, 0x53, K_CALLNEXT, 0, "CUE/LOOP CALL 2X" },
     { MC_DECK2, 0x51, K_CALLPREV, 0, "CUE/LOOP CALL 1/2X" },
@@ -1106,6 +1163,20 @@ static void handle_note(int ch, int note, int on)
     }
     if (ch == MC_PAD2 || ch == MC_PAD2_SH) {
         handle_pad(1, note, on, ch == MC_PAD2_SH);
+        return;
+    }
+
+    /* SHIFT+BEAT JUMP (the PAD FX 2 mode button, deck channel note 0x6B,
+     * unmapped otherwise): open the toolkit's STEMS panel on the screen. */
+    if (stems_pads_touch && (ch == MC_DECK1 || ch == MC_DECK2) && note == 0x6B) {
+        if (on)
+            stems_touch_send(ch == MC_DECK1 ? 0 : 1, STEMS_TOUCH_OPEN);
+        return;
+    }
+    /* SHIFT+SAMPLER (the KEY SHIFT mode button, note 0x6F): the KEY panel. */
+    if (stems_pads_touch && (ch == MC_DECK1 || ch == MC_DECK2) && note == 0x6F) {
+        if (on)
+            stems_touch_send(ch == MC_DECK1 ? 0 : 1, STEMS_TOUCH_KEY_OPEN);
         return;
     }
 
@@ -1410,7 +1481,6 @@ static char stems_pad_state_path[512];
 static int stems_pad_command_fd = -1;
 static int stems_pad_state_fd = -1;
 static uint32_t stems_pad_command_sequence;
-static uint32_t stems_pad_state_sequence;
 
 static void stems_pad_sibling_path(char *output, size_t capacity,
                                    const char *name)
@@ -1439,6 +1509,38 @@ static void stems_pad_init_paths(void)
         logmsg("ddj400: STEMS command %s\n", stems_pad_command_path);
         logmsg("ddj400: STEMS state %s\n", stems_pad_state_path);
     }
+}
+
+/* The toolkit route: same packet, into the FIFO the rbpi4b touch shim reads
+ * (created by rbp at start; no reader means the write is dropped). */
+static void stems_touch_send(int deck, int control)
+{
+    static char path[512];
+    struct stems_pad_command_packet packet;
+    int fd;
+
+    if (!path[0])
+        stems_pad_sibling_path(path, sizeof(path), "rx3-stems-touch.fifo");
+    fd = open(path, O_WRONLY | O_NONBLOCK);
+    if (fd < 0) {
+        logmsg("  STEMS touch: %s: %s\n", path, strerror(errno));
+        return;
+    }
+    memset(&packet, 0, sizeof(packet));
+    packet.magic = STEMS_PAD_COMMAND_MAGIC;
+    packet.sequence = ++stems_pad_command_sequence;
+    packet.deck = (uint8_t)deck;
+    packet.control = (uint8_t)control;
+    (void)write(fd, &packet, sizeof(packet));
+    close(fd);
+    if (opt_verbose)
+        logmsg("  STEMS touch deck%d %s\n", deck + 1,
+               control == STEMS_TOUCH_OPEN ? "open STEMS panel" :
+               control == STEMS_TOUCH_KEY_OPEN ? "open KEY panel" :
+               control == STEMS_TOUCH_KEY_PART ? "KEY -1" :
+               control == STEMS_TOUCH_KEY_PART + 1 ? "KEY own key" :
+               control == STEMS_TOUCH_KEY_PART + 2 ? "KEY +1" :
+               control == 0 ? "INST" : control == 1 ? "VOCAL" : "DRUMS");
 }
 
 static void stems_pad_send_command(int deck, int control)
@@ -1486,6 +1588,49 @@ static void stems_pad_state_tick(int midi_fd)
     if (opt_verbose)
         logmsg("  STEMS LEDs deck1=0x%02x deck2=0x%02x\n",
                packet.active[0], packet.active[1]);
+}
+
+/* KEY SHIFT page LEDs (toolkit core): written by the rbpi4b touch shim from the
+ * toolkit's key state -- bit n lights pad n+1: 1 below the track's key, 2 at it,
+ * 3 above. Reopened until the shim has created it. */
+#define KEY_PAD_STATE_MAGIC 0x5359454bu
+struct key_pad_state_packet {
+    uint32_t magic;
+    uint32_t sequence;
+    uint8_t leds[2];
+    uint8_t reserved[2];
+};
+static int key_pad_state_fd = -1;
+
+static void key_pad_state_tick(int midi_fd)
+{
+    static char path[512];
+    struct key_pad_state_packet packet;
+
+    if (!stems_pads_touch)
+        return;
+    if (!path[0])
+        stems_pad_sibling_path(path, sizeof(path), "rx3-key-pad-state.bin");
+    if (key_pad_state_fd < 0)
+        key_pad_state_fd = open(path, O_RDONLY | O_NONBLOCK);
+    if (key_pad_state_fd < 0)
+        return;
+    if (pread(key_pad_state_fd, &packet, sizeof(packet), 0) !=
+            (ssize_t)sizeof(packet) ||
+        packet.magic != KEY_PAD_STATE_MAGIC ||
+        packet.sequence == key_pad_state_sequence)
+        return;
+    key_pad_state_sequence = packet.sequence;
+    for (int deck = 0; deck < 2; deck++) {
+        int channel = deck == 0 ? MC_PAD1 : MC_PAD2;
+
+        for (int part = 0; part < 3; part++)
+            led_send(midi_fd, channel, 0x70 + part,
+                     (packet.leds[deck] & (1u << part)) ? 0x7f : 0);
+    }
+    if (opt_verbose)
+        logmsg("  KEY LEDs deck1=0x%02x deck2=0x%02x\n",
+               packet.leds[0], packet.leds[1]);
 }
 
 static void native_led_state_init_path(void)
@@ -1593,12 +1738,23 @@ static void native_led_state_tick(int midi_fd)
 
     for (int deck = 0; deck < 2; deck++) {
         int mode = packet.play_mode[deck];
-        int loaded =
-            packet.total_time[deck] != 0xffffffffu &&
-            packet.total_time[deck] != 0u;
         int playing = mode == 2 || mode == 3;
         int paused = mode == 4 || mode == 6;
         int play_led = playing ? 1 : (paused ? blink : 0);
+        int loaded =
+            packet.total_time[deck] != 0xffffffffu &&
+            packet.total_time[deck] != 0u;
+        /* Reverted 2026-09-30 by user request, back to this original
+         * lit-once-loaded behavior. Two mode-driven alternatives were tried
+         * and worked in principle but were rolled back without a recorded
+         * reason -- if revisiting, the useful finding to keep is that the
+         * native RX3_LED_CUE flag (packet.flags[deck] & RX3_LED_CUE) is
+         * NOT a live "should the button be lit now" signal: live telemetry
+         * capture that day showed it stays 1 across mode 2 (playing), 4
+         * (paused off-cue), 6 (stopped at cue) and 7 (preview) alike -- it
+         * only means "this deck has a cue point memorized at all". Any
+         * future attempt needs to key off `mode` (2/3 playing, 4 paused
+         * off-cue, 6 stopped-at-cue, 7 CUE-held preview) instead. */
         int cue_led = loaded ? 1 : 0;
 
         if (native_led_force_sync || force_transport ||
@@ -2190,6 +2346,14 @@ int main(int argc, char **argv)
         }
     }
 
+    {
+        const char *sp = getenv("RX3_STEMS_PADS");
+        stems_pads_touch = sp && strcmp(sp, "touch") == 0;
+        logmsg("ddj400: STEMS pads (PAD FX 2) -> %s\n",
+               stems_pads_touch ? "touch shim FIFO (toolkit core)"
+                                : "command file (legacy core)");
+    }
+
     build_cc14();
     jogs[0].midi_ch = MC_DECK1; jogs[0].send_ch = 1;
     jogs[1].midi_ch = MC_DECK2; jogs[1].send_ch = 2;
@@ -2282,6 +2446,7 @@ static void run_device(int fd)
             vu_tick(fd);
             native_led_state_tick(fd);
             stems_pad_state_tick(fd);
+            key_pad_state_tick(fd);
             pad_led_tick(fd);
             color_fx_led_tick(fd);
             search_led_tick(fd);
@@ -2331,6 +2496,7 @@ static void run_device(int fd)
         vu_tick(fd);
             native_led_state_tick(fd);
             stems_pad_state_tick(fd);
+            key_pad_state_tick(fd);
             pad_led_tick(fd);
             color_fx_led_tick(fd);
             search_led_tick(fd);
