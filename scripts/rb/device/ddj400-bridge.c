@@ -156,6 +156,48 @@ static int   jog_idle_ms = 60;     /* emit speed 0 after this idle time  */
 
 static int fifo_fd = -1;
 
+/* Keepalive: with no physical input, exercise the USB-MIDI endpoint so
+ * nothing upstream (the kernel's own USB autosuspend, or the DDJ-400
+ * itself) can decide the link is idle and let it go to standby. MIDI
+ * Active Sensing (0xFE) is the standard, content-free byte for exactly
+ * this -- single byte, no channel, no LED or UI effect, and already
+ * silently dropped by our own read loop's `b >= 0xF8` filter if the
+ * DDJ-400 ever echoes one back. Off with DDJ400_KEEPALIVE=0; the FLX4
+ * row in the older controllers.c framework did the same job with its own
+ * CTRL_KEEPALIVE (docs/08-controls.md in RX3-RBPI4B-RK3399), unrelated
+ * code but the same idea. */
+static long long now_ms(void);
+static void logmsg(const char *fmt, ...);
+static int opt_keepalive = 1;
+#define KEEPALIVE_IDLE_MS   8000LL   /* only once nothing physical for this long */
+#define KEEPALIVE_PERIOD_MS 5000LL   /* ...then resend this often while idle */
+static long long g_last_input_ms;
+static long long g_last_keepalive_ms;
+
+static void keepalive_note_input(void)
+{
+    g_last_input_ms = now_ms();
+}
+
+static void keepalive_tick(int fd)
+{
+    long long now;
+    unsigned char active_sensing = 0xFE;
+
+    if (!opt_keepalive)
+        return;
+    now = now_ms();
+    if (now - g_last_input_ms < KEEPALIVE_IDLE_MS)
+        return;
+    if (now - g_last_keepalive_ms < KEEPALIVE_PERIOD_MS)
+        return;
+    g_last_keepalive_ms = now;
+    if (write(fd, &active_sensing, 1) != 1 && opt_verbose)
+        logmsg("ddj400: keepalive write: %s\n", strerror(errno));
+    else if (opt_verbose)
+        logmsg("ddj400: keepalive (idle %lldms)\n", now - g_last_input_ms);
+}
+
 #define INTERFACE_TOGGLE_REQUEST \
     "/run/rx3-interface-toggle.request"
 #define INTERFACE_TOGGLE_HOLD_MS 5000LL
@@ -2403,6 +2445,14 @@ int main(int argc, char **argv)
                                 : "command file (legacy core)");
     }
 
+    {
+        const char *ka = getenv("DDJ400_KEEPALIVE");
+        opt_keepalive = !(ka && strcmp(ka, "0") == 0);
+        g_last_input_ms = g_last_keepalive_ms = now_ms();
+        logmsg("ddj400: keepalive (Active Sensing after %llds idle) -> %s\n",
+               KEEPALIVE_IDLE_MS / 1000, opt_keepalive ? "on" : "off");
+    }
+
     build_cc14();
     jogs[0].midi_ch = MC_DECK1; jogs[0].send_ch = 1;
     jogs[1].midi_ch = MC_DECK2; jogs[1].send_ch = 2;
@@ -2500,6 +2550,7 @@ static void run_device(int fd)
             pad_led_tick(fd);
             color_fx_led_tick(fd);
             search_led_tick(fd);
+            keepalive_tick(fd);
             continue;
         }
         n = read(fd, buf, sizeof(buf));
@@ -2531,11 +2582,14 @@ static void run_device(int fd)
             int ch = status & 0x0F;
             if (type == 0x90 || type == 0x80) {
                 int on = (type == 0x90 && b > 0);
+                keepalive_note_input();
                 led_handle_input(fd, ch, d1, on);
                 handle_note(ch, d1, on);
             }
-            else if (type == 0xB0)
+            else if (type == 0xB0) {
+                keepalive_note_input();
                 handle_cc(ch, d1, b);
+            }
             else if (opt_sniff)
                 logmsg("MIDI ch%d status=0x%02x d1=%d d2=%d\n", ch + 1, status, d1, b);
         }
@@ -2551,6 +2605,7 @@ static void run_device(int fd)
             pad_led_tick(fd);
             color_fx_led_tick(fd);
             search_led_tick(fd);
+            keepalive_tick(fd);
     }
     return;
 }
