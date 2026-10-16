@@ -219,6 +219,22 @@ static int interface_toggle_fired;
  * a deck's SHIFT does not by itself change what MC_MIXER sends. */
 static int shift_held[2];
 
+/* MASTER REC (item 7, 2026-10-15): hold SHIFT alone for 3s to toggle the
+ * native recording on/off, by user request ("aperte e pressione apenas
+ * SHIFT por 3 segundos"). The native call itself lives in rbpi4b's own
+ * fbshim.so (pointsrc.c master_rec_toggle_tick()), reached the same way the
+ * screenshot tour's touch injection is -- a request file in the same /tmp
+ * directory as rb-ctrl.fifo (rx3-master-rec-toggle.request, derived from
+ * fifo_path the same way vu_path is, see master_rec_init_path()). "Alone"
+ * is enforced by canceling the hold the moment any other note/CC arrives
+ * while SHIFT is down (main loop, right after handle_note()/handle_cc()) --
+ * without that, any long combo held with SHIFT (e.g. SHIFT+FX ch select)
+ * would also toggle recording after 3s. */
+#define MASTER_REC_HOLD_MS 3000LL
+static long long master_rec_hold_started_ms = -1;
+static int master_rec_hold_fired;
+static char master_rec_toggle_path[512];
+
 /* SEARCH (SHIFT+MASTER CUE): toggles the on-screen keyboard. While active,
  * the MASTER CUE LED blinks at 1Hz so it's obvious search is open. */
 static int search_active;
@@ -1336,6 +1352,62 @@ static int vu_left;
 static int vu_right;
 static int vu_idle_ticks;
 
+static void master_rec_init_path(void)
+{
+    const char *slash = strrchr(fifo_path, '/');
+    static const char name[] = "/rx3-master-rec-toggle.request";
+
+    if (slash) {
+        size_t length = (size_t)(slash - fifo_path);
+
+        if (length > sizeof(master_rec_toggle_path) - sizeof(name))
+            length = sizeof(master_rec_toggle_path) - sizeof(name);
+
+        memcpy(master_rec_toggle_path, fifo_path, length);
+        master_rec_toggle_path[length] = '\0';
+        strcat(master_rec_toggle_path, name);
+    } else {
+        snprintf(master_rec_toggle_path, sizeof(master_rec_toggle_path),
+                  "rx3-master-rec-toggle.request");
+    }
+
+    if (opt_verbose)
+        logmsg("ddj400: MASTER REC toggle request %s\n",
+               master_rec_toggle_path);
+}
+
+static int request_master_rec_toggle(void)
+{
+    int fd = open(master_rec_toggle_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+    if (fd < 0) {
+        logmsg("  MASTER REC toggle request failed: %s\n", strerror(errno));
+        return 0;
+    }
+    close(fd);
+    return 1;
+}
+
+static void master_rec_cancel_hold(void)
+{
+    if (master_rec_hold_started_ms >= 0 && !master_rec_hold_fired) {
+        master_rec_hold_started_ms = -1;
+        if (opt_verbose)
+            logmsg("  SHIFT hold cancelled (other control used)\n");
+    }
+}
+
+static void master_rec_hold_tick(void)
+{
+    if (master_rec_hold_started_ms < 0 || master_rec_hold_fired)
+        return;
+    if (now_ms() - master_rec_hold_started_ms < MASTER_REC_HOLD_MS)
+        return;
+    master_rec_hold_fired = 1;
+    if (request_master_rec_toggle())
+        logmsg("  SHIFT held 3s -> MASTER REC toggle requested\n");
+}
+
 static void vu_init_path(void)
 {
     const char *slash = strrchr(fifo_path, '/');
@@ -2148,6 +2220,17 @@ static void led_handle_input(int fd, int channel, int note, int on)
      * though it's on a different MIDI channel. */
     if ((channel == 0 || channel == 1) && note == 0x3f) {
         shift_held[channel] = on;
+        if (on) {
+            if (master_rec_hold_started_ms < 0) {
+                master_rec_hold_started_ms = now_ms();
+                master_rec_hold_fired = 0;
+                if (opt_verbose)
+                    logmsg("  SHIFT hold started (MASTER REC at 3s)\n");
+            }
+        } else if (!shift_held[0] && !shift_held[1]) {
+            master_rec_hold_started_ms = -1;
+            master_rec_hold_fired = 0;
+        }
         return;
     }
 
@@ -2473,6 +2556,7 @@ int main(int argc, char **argv)
     }
 
     vu_init_path();
+    master_rec_init_path();
     native_led_state_init_path();
     stems_pad_init_paths();
     mixer_state_init_path();
@@ -2539,6 +2623,7 @@ static void run_device(int fd)
         }
         if (pr == 0) {
             interface_toggle_tick();
+            master_rec_hold_tick();
             jog_tick();
             search_tick();
             mixer_state_tick();
@@ -2585,15 +2670,19 @@ static void run_device(int fd)
                 keepalive_note_input();
                 led_handle_input(fd, ch, d1, on);
                 handle_note(ch, d1, on);
+                if (on && d1 != 0x3f)
+                    master_rec_cancel_hold();
             }
             else if (type == 0xB0) {
                 keepalive_note_input();
                 handle_cc(ch, d1, b);
+                master_rec_cancel_hold();
             }
             else if (opt_sniff)
                 logmsg("MIDI ch%d status=0x%02x d1=%d d2=%d\n", ch + 1, status, d1, b);
         }
         interface_toggle_tick();
+        master_rec_hold_tick();
         jog_tick();
         search_tick();
         mixer_state_tick();
