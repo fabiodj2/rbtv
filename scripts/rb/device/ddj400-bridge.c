@@ -62,6 +62,10 @@
 #define K_SELECTOR    0x420c
 #define K_SOURCE      0x0201
 #define K_MENU        0x0206
+#define K_SHORTCUT    0x0210  /* UiKey_Shortcut, browse mode 10 -- opens on a
+                                * plain press+release, same shape as K_MENU
+                                * above (see rbpi4b's rbp_abi.h for the full
+                                * derivation off rbp's live dispatch table). */
 #define K_BACK        0x420d
 #define K_LOAD        0x4311   /* + deck channel */
 #define K_PLAY        0x4101
@@ -1031,7 +1035,7 @@ static const struct notemap notemap[] = {
     { MC_MIXER, 0x46, K_LOAD,     1,         "LOAD deck 1" },
     { MC_MIXER, 0x47, K_LOAD,     2,         "LOAD deck 2" },
     { MC_MIXER, 0x68, K_SOURCE,   CH_GLOBAL, "SHIFT+LOAD 1 (source/usb)" },
-    { MC_MIXER, 0x7A, K_MENU,     CH_GLOBAL, "SHIFT+LOAD 2 (menu)" },
+    { MC_MIXER, 0x7A, K_SHORTCUT, CH_GLOBAL, "SHIFT+LOAD 2 (shortcut)" },
     /* DECK transport / loops (deck channel) */
     { MC_DECK1, 0x68, K_QUANTIZE, 0,
       "SHIFT+CHANNEL CUE 1 -> QUANTIZE deck 1" },
