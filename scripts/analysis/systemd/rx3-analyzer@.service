@@ -1,0 +1,19 @@
+[Unit]
+Description=rx3-analyze: Tier-1 analysis worker %i
+After=rx3-analyze-watch.service
+Requires=rx3-analyze-watch.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rx3-analyze-worker.sh
+Restart=on-failure
+RestartSec=2
+# Measured: 4 of these in parallel on the A53s cost the same wall time as
+# one alone (docs/17) -- no CPUAffinity pin needed, Nice is enough to keep
+# them from contending with the big-core engine under any edge case.
+Nice=10
+User=orangepi
+Group=orangepi
+
+[Install]
+WantedBy=multi-user.target
