@@ -276,6 +276,125 @@ static int32_t scale_headphone_s24(int32_t sample, int gain)
     return (int32_t)scaled;
 }
 
+/* Master output digital gain, in dB, configurable without rebuilding via
+ * RX3_MASTER_GAIN_DB (same idea as RX3_HP_GAIN_X below, just in dB instead
+ * of a raw multiplier -- dB is what makes sense to reason about for a line
+ * level target).
+ *
+ * Live measurement on 2026-10-18 (peak_m in the periodic log below, which
+ * is sampled *before* this gain is applied): the engine's own master
+ * output peaks around -23..-24 dBFS. A previous session's fixed +9dB left
+ * post-gain peaks around -14..-15 dBFS with master_limited staying 0 the
+ * whole time -- nowhere near the ceiling. The physical MASTER LEVEL knob
+ * was already confirmed at max, so the shortfall is upstream of this shim
+ * (likely the engine's own master bus running at the headroom a real
+ * XDJ-RX3's analogue output stage would make up, which this ALSA bridge
+ * has no equivalent of).
+ *
+ * +21dB was found live the same session, by ear, with the operator
+ * listening on real monitors through the DDJ-400: loud passages peaked
+ * around -2.5 dBFS (peak_m hitting the track's own ~560k ceiling,
+ * post-gain), master_limited stayed 0, and the operator confirmed "som
+ * bom, limpo, sem estalo" (good, clean, no click/pop) -- so this is the
+ * new default, not the conservative +9 from before. The launcher script
+ * (scripts/rk3399/start-rk3399.sh, MASTER_GAIN_DB) always sets
+ * RX3_MASTER_GAIN_DB explicitly, so this fallback is mainly for rbp being
+ * run directly without it -- kept in sync with that script's default so
+ * the two don't drift.
+ */
+static float master_gain_linear(void)
+{
+    static float gain = 0.0f;
+    static int inited = 0;
+
+    if (!inited) {
+        const char *s = getenv("RX3_MASTER_GAIN_DB");
+        float db = 21.0f;
+
+        if (s && *s) {
+            char *end = NULL;
+            float v = strtof(s, &end);
+            if (end != s)
+                db = v;
+        }
+
+        /* 10^(db/20) without libm: this .so links soft-float with no -lm
+         * against the RX3 chroot's glibc 2.13 (see the shims Makefile),
+         * and every new libm symbol is a new GLIBC-version risk against
+         * that constraint (see build-rk3399-shims.sh's version check).
+         * This only ever runs once at startup, so a plain loop over
+         * integer dB steps -- 10^(1/20) multiplied/divided in, rounding
+         * the requested dB to the nearest integer -- is simpler than
+         * adding a link dependency for a single startup computation. */
+        {
+            const float step_up = 1.1220184543f; /* 10^(1/20) */
+            int n = (int)(db + (db >= 0.0f ? 0.5f : -0.5f));
+            int i;
+            float g = 1.0f;
+
+            if (n >= 0) {
+                for (i = 0; i < n; i++) g *= step_up;
+            } else {
+                for (i = 0; i < -n; i++) g /= step_up;
+            }
+            gain = g;
+        }
+
+        alog("audioshim: master digital gain=%+.1fdB (%.4fx)%s\n", db, gain,
+             (s && *s) ? " [RX3_MASTER_GAIN_DB]" : " [default]");
+        inited = 1;
+    }
+
+    return gain;
+}
+
+/* Counted, not logged inline: scale_master_s24() runs per-sample (up to
+ * ~88k calls/sec across both channels at 44.1kHz), so any per-clip file
+ * I/O here would itself be enough to glitch the audio thread. Reported
+ * from the existing periodic writei log instead (see s_master_limited_count
+ * below). */
+static unsigned long s_master_limited_count;
+
+/* Soft-knee limiter: below MASTER_KNEE_RATIO of full scale the signal
+ * passes untouched (the common case at any sane gain setting, so this is a
+ * cheap compare-and-return for nearly every sample). Above it, a rational
+ * curve (no libm -- see master_gain_linear()'s comment on why) compresses
+ * the overshoot so it approaches the ceiling asymptotically instead of
+ * hard-clamping: a loud transient folds into a rounded peak instead of the
+ * flat-top click the previous hard clamp produced. */
+#define MASTER_CEILING     8388607.0f
+#define MASTER_KNEE_RATIO  0.85f
+#define MASTER_KNEE_THRESH (MASTER_CEILING * MASTER_KNEE_RATIO)
+
+static int32_t scale_master_s24(int32_t sample)
+{
+    float scaled, mag;
+
+    sample = s24_sign_extend(sample);
+    scaled = (float)sample * master_gain_linear();
+
+    mag = scaled < 0.0f ? -scaled : scaled;
+    if (mag > MASTER_KNEE_THRESH) {
+        float sign = scaled < 0.0f ? -1.0f : 1.0f;
+        float over = mag - MASTER_KNEE_THRESH;
+        float headroom = MASTER_CEILING - MASTER_KNEE_THRESH;
+        float compressed = MASTER_KNEE_THRESH + headroom * over / (headroom + over);
+
+        s_master_limited_count++;
+        scaled = sign * compressed;
+    }
+
+    /* Belt and braces: the curve above asymptotes to MASTER_CEILING and
+     * never crosses it, but clamp anyway so a NaN/garbage input can't slip
+     * a value past the s24 range into the cast below. */
+    if (scaled > MASTER_CEILING)
+        scaled = MASTER_CEILING;
+    else if (scaled < -MASTER_CEILING - 1.0f)
+        scaled = -MASTER_CEILING - 1.0f;
+
+    return (int32_t)scaled;
+}
+
 static inline int is_real(snd_pcm_t *pcm)
 {
     return (pcm && pcm == g_real_playback);
@@ -692,6 +811,8 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
 
                 if (c >= 2)
                     sample = scale_headphone_s24(sample, hp_gain);
+                else
+                    sample = scale_master_s24(sample);
 
                 g_out4ch[i * 4 + c] = s24_to_s16(sample);
 
@@ -716,9 +837,18 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
     if (g_real_playback && real_snd_pcm_writei) {
         written = real_snd_pcm_writei(g_real_playback, g_out4ch, size);
         if (written < 0) {
+            /* This recovery path was silent -- only visible if it happened
+             * to land on the 1-in-500 sampled log line below. An xrun here
+             * is audible as a pop/click (re-prepare resyncs the PCM), so
+             * log every occurrence to find out how often it really
+             * happens, independent of the sampling. */
+            alog("audioshim: writei xrun #%lu err=%ld, recovering\n",
+                 g_write_count, (long)written);
             if (real_snd_pcm_prepare)
                 real_snd_pcm_prepare(g_real_playback);
             written = real_snd_pcm_writei(g_real_playback, g_out4ch, size);
+            alog("audioshim: writei xrun #%lu recovered written=%ld\n",
+                 g_write_count, (long)written);
         }
     } else {
         /* Safety sleep to pace real-time audio threads if hardware is delayed */
@@ -726,10 +856,13 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_ufr
     }
 
     if ((g_write_count % 500) == 1) {
-        alog("audioshim: writei #%lu frames=%lu written=%ld peak_m=%d peak_hp=%d\n",
-             g_write_count, size, (long)written, s_peak_master, s_peak_hp);
+        alog("audioshim: writei #%lu frames=%lu written=%ld peak_m=%d peak_hp=%d "
+             "master_limited=%lu\n",
+             g_write_count, size, (long)written, s_peak_master, s_peak_hp,
+             s_master_limited_count);
         s_peak_master = 0;
         s_peak_hp = 0;
+        s_master_limited_count = 0;
     }
 
     return size;
@@ -788,6 +921,13 @@ int sched_setaffinity(pid_t pid, size_t cpusetsize, const void *cpuset)
 
 int sched_setscheduler(pid_t pid, int policy, const void *param)
 {
+    /* Live-tested unstubbed 2026-09-27 (master-output click investigation,
+     * on the theory that docs/07 F6's memshim poll() fix already covers
+     * the GpioManager busy-spin that motivated this stub -- see git
+     * history for that attempt): rbp never actually calls this function,
+     * so it was inconclusive either way and reverted to the safe stub
+     * pending trying pthread_setschedparam instead (the more likely real
+     * mechanism, and the one that actually carries the lockup risk). */
     (void)pid; (void)policy; (void)param;
     return 0;
 }
