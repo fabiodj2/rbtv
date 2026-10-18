@@ -291,16 +291,21 @@ static int32_t scale_headphone_s24(int32_t sample, int gain)
  * XDJ-RX3's analogue output stage would make up, which this ALSA bridge
  * has no equivalent of).
  *
- * +21dB was found live the same session, by ear, with the operator
- * listening on real monitors through the DDJ-400: loud passages peaked
- * around -2.5 dBFS (peak_m hitting the track's own ~560k ceiling,
- * post-gain), master_limited stayed 0, and the operator confirmed "som
- * bom, limpo, sem estalo" (good, clean, no click/pop) -- so this is the
- * new default, not the conservative +9 from before. The launcher script
- * (scripts/rk3399/start-rk3399.sh, MASTER_GAIN_DB) always sets
- * RX3_MASTER_GAIN_DB explicitly, so this fallback is mainly for rbp being
- * run directly without it -- kept in sync with that script's default so
- * the two don't drift.
+ * +21dB was found live the same session, by ear -- but with TRIM set low
+ * (the -23..-24dBFS pre-gain reading above). Corrected 2026-10-18, same
+ * day: with TRIM at its correct operating point (meter's orange segment
+ * lighting on peaks, per Pioneer's own gain-staging procedure) and MASTER
+ * LEVEL at max -- the actual live operating condition -- the engine's own
+ * pre-gain peaks run far hotter (measured up to ~1.53M, i.e. ~-14.8dBFS),
+ * and +21dB overshot the ceiling by several dB, producing audible
+ * saturation (master_limited spiking into the tens of thousands per
+ * window). Re-tuned live the same way with TRIM/MASTER at that correct
+ * position: +22dB was the value that stayed clean (operator confirmed
+ * "som limpo" at each step up to and including 22; master_limited read 0
+ * throughout). The launcher script (scripts/rk3399/start-rk3399.sh,
+ * MASTER_GAIN_DB) always sets RX3_MASTER_GAIN_DB explicitly, so this
+ * fallback is mainly for rbp being run directly without it -- kept in
+ * sync with that script's default so the two don't drift.
  */
 static float master_gain_linear(void)
 {
@@ -309,7 +314,7 @@ static float master_gain_linear(void)
 
     if (!inited) {
         const char *s = getenv("RX3_MASTER_GAIN_DB");
-        float db = 21.0f;
+        float db = 22.0f;
 
         if (s && *s) {
             char *end = NULL;
