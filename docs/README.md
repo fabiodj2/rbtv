@@ -21,6 +21,7 @@ Start here:
 | [14-handover](14-handover.md) | Session handover: deployed artefacts/hashes, restore commands, input, playback fix |
 | [15-playback-fix](15-playback-fix.md) | Why PLAY did nothing: the rb2go `getTotalLength` workaround, and the FIFO/daemon restart gotcha |
 | [16-handoff](16-handoff.md) | **Session handoff**: deployed hashes, rebuild/deploy, open audio-pop fix, latent `keyshim`/`UiMain` crash |
+| [20-flicker-zoom-fix](20-flicker-zoom-fix.md) | Waveform flicker root cause (ARGB/RGB16 pitch mismatch) + step-by-step hardware check before committing the fix |
 
 Related, external to this folder:
 
